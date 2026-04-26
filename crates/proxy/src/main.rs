@@ -1,12 +1,22 @@
+#![warn(clippy::pedantic)]
+
+mod code_lens;
+mod documents;
 mod framing;
 mod goals;
+mod inlay;
+mod lean_rpc;
 mod lsp;
 mod snoop;
 mod state;
 
 use std::{env, process::Stdio};
 
-use tokio::{io, process::Command, sync::watch};
+use tokio::{
+    io,
+    process::Command,
+    sync::{mpsc, watch},
+};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -30,10 +40,29 @@ async fn main() -> io::Result<()> {
     let child_stdout = child.stdout.take().expect("child stdout");
 
     let state = state::StateHandle::new();
+    let documents = documents::Documents::new();
     let (cursor_tx, cursor_rx) = watch::channel(None);
+    let (inlay_requests_tx, inlay_requests_rx) = mpsc::channel(64);
+    let (lens_requests_tx, lens_requests_rx) = mpsc::channel(64);
 
-    let (lsp_handle, c2s_done) = lsp::spawn(child_stdin, child_stdout, cursor_tx, state.clone());
-    goals::spawn(lsp_handle, cursor_rx, state);
+    let (lsp_handle, c2s_done) = lsp::spawn(
+        child_stdin,
+        child_stdout,
+        cursor_tx,
+        state.clone(),
+        documents.clone(),
+        inlay_requests_tx,
+        lens_requests_tx,
+    );
+    let rpc = lean_rpc::RpcManager::new(lsp_handle.clone(), &state);
+    goals::spawn(rpc, cursor_rx, state.clone());
+    inlay::spawn(
+        lsp_handle.clone(),
+        state.clone(),
+        documents.clone(),
+        inlay_requests_rx,
+    );
+    code_lens::spawn(lsp_handle, state, documents, lens_requests_rx);
 
     tokio::select! {
         _ = c2s_done => {

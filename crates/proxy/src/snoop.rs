@@ -30,3 +30,37 @@ pub fn is_initialized(body: &[u8]) -> bool {
         .and_then(|v| Some(v.get("method")?.as_str()? == "initialized"))
         .unwrap_or(false)
 }
+
+pub fn extract_did_open(body: &[u8]) -> Option<String> {
+    extract_doc_uri(body, "textDocument/didOpen")
+}
+
+pub fn extract_did_close(body: &[u8]) -> Option<String> {
+    extract_doc_uri(body, "textDocument/didClose")
+}
+
+fn extract_doc_uri(body: &[u8], expected_method: &str) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    if v.get("method")?.as_str()? != expected_method {
+        return None;
+    }
+    Some(v.pointer("/params/textDocument/uri")?.as_str()?.to_string())
+}
+
+pub fn extract_did_open_version(body: &[u8]) -> Option<(String, i64)> {
+    extract_doc_uri_and_version(body, "textDocument/didOpen")
+}
+
+pub fn extract_did_change(body: &[u8]) -> Option<(String, i64)> {
+    extract_doc_uri_and_version(body, "textDocument/didChange")
+}
+
+fn extract_doc_uri_and_version(body: &[u8], expected_method: &str) -> Option<(String, i64)> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    if v.get("method")?.as_str()? != expected_method {
+        return None;
+    }
+    let uri = v.pointer("/params/textDocument/uri")?.as_str()?.to_string();
+    let version = v.pointer("/params/textDocument/version")?.as_i64()?;
+    Some((uri, version))
+}

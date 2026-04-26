@@ -8,12 +8,13 @@ use std::{
 
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader, Stdout},
     process::{ChildStdin, ChildStdout},
     sync::{mpsc, oneshot, watch},
 };
 
 use crate::{
+    documents::Documents,
     framing::{encode_frame, read_message},
     snoop::{self, CursorPos},
     state::StateHandle,
@@ -31,6 +32,18 @@ pub struct ResponseError {
 
 type Pending = HashMap<String, oneshot::Sender<Result<Value, ResponseError>>>;
 
+#[derive(Debug)]
+pub struct InlayRequest {
+    pub id: Value,
+    pub params: Value,
+}
+
+#[derive(Debug)]
+pub struct CodeLensRequest {
+    pub id: Value,
+    pub params: Value,
+}
+
 #[derive(Clone)]
 pub struct LspHandle {
     inner: Arc<Inner>,
@@ -38,6 +51,7 @@ pub struct LspHandle {
 
 struct Inner {
     to_server: mpsc::Sender<Vec<u8>>,
+    to_zed: mpsc::Sender<Vec<u8>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<Pending>>,
     init_rx: watch::Receiver<bool>,
@@ -55,6 +69,28 @@ impl LspHandle {
         method: &str,
         params: Value,
     ) -> Result<Value, ResponseError> {
+        self.send_request(&self.inner.to_server, id, method, params, "server")
+            .await
+    }
+
+    pub async fn request_client(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ResponseError> {
+        let id = self.alloc_id();
+        self.send_request(&self.inner.to_zed, &id, method, params, "zed")
+            .await
+    }
+
+    async fn send_request(
+        &self,
+        target: &mpsc::Sender<Vec<u8>>,
+        id: &str,
+        method: &str,
+        params: Value,
+        target_name: &'static str,
+    ) -> Result<Value, ResponseError> {
         let (tx, rx) = oneshot::channel();
         self.inner
             .pending
@@ -70,7 +106,7 @@ impl LspHandle {
         });
         let frame = encode_frame(&serde_json::to_vec(&body).expect("serialize request"));
 
-        if self.inner.to_server.send(frame).await.is_err() {
+        if target.send(frame).await.is_err() {
             self.inner
                 .pending
                 .lock()
@@ -78,7 +114,7 @@ impl LspHandle {
                 .remove(id);
             return Err(ResponseError {
                 code: -1,
-                message: "server pipe closed".into(),
+                message: format!("{target_name} pipe closed"),
             });
         }
         rx.await.unwrap_or_else(|_| {
@@ -90,17 +126,26 @@ impl LspHandle {
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> std::io::Result<()> {
+        send_notification(&self.inner.to_server, method, params, "server").await
+    }
+
+    #[allow(dead_code)]
+    pub async fn notify_client(&self, method: &str, params: Value) -> std::io::Result<()> {
+        send_notification(&self.inner.to_zed, method, params, "zed").await
+    }
+
+    pub async fn respond_to_client(&self, id: Value, result: Value) -> std::io::Result<()> {
         let body = json!({
             "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
+            "id": id,
+            "result": result,
         });
-        let frame = encode_frame(&serde_json::to_vec(&body).expect("serialize notification"));
+        let frame = encode_frame(&serde_json::to_vec(&body).expect("serialize response"));
         self.inner
-            .to_server
+            .to_zed
             .send(frame)
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "server pipe closed"))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "zed pipe closed"))
     }
 
     pub async fn cancel(&self, id: &str) {
@@ -132,31 +177,70 @@ impl LspHandle {
     }
 }
 
+async fn send_notification(
+    target: &mpsc::Sender<Vec<u8>>,
+    method: &str,
+    params: Value,
+    target_name: &'static str,
+) -> std::io::Result<()> {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    });
+    let frame = encode_frame(&serde_json::to_vec(&body).expect("serialize notification"));
+    target.send(frame).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            format!("{target_name} pipe closed"),
+        )
+    })
+}
+
 pub fn spawn(
     child_stdin: ChildStdin,
     child_stdout: ChildStdout,
     cursor_tx: watch::Sender<Option<CursorPos>>,
     state: StateHandle,
+    documents: Documents,
+    inlay_requests: mpsc::Sender<InlayRequest>,
+    lens_requests: mpsc::Sender<CodeLensRequest>,
 ) -> (LspHandle, tokio::task::JoinHandle<()>) {
     let (to_server_tx, to_server_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (to_zed_tx, to_zed_rx) = mpsc::channel::<Vec<u8>>(64);
     let (init_tx, init_rx) = watch::channel(false);
     let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(Pending::new()));
 
     let inner = Arc::new(Inner {
         to_server: to_server_tx.clone(),
+        to_zed: to_zed_tx.clone(),
         next_id: AtomicU64::new(0),
         pending: pending.clone(),
         init_rx,
     });
+    let handle = LspHandle {
+        inner: inner.clone(),
+    };
 
-    tokio::spawn(writer_task(child_stdin, to_server_rx));
-    let c2s = tokio::spawn(c2s_task(to_server_tx, cursor_tx, init_tx));
-    tokio::spawn(s2c_task(child_stdout, pending, state));
+    tokio::spawn(server_writer_task(child_stdin, to_server_rx));
+    tokio::spawn(zed_writer_task(tokio::io::stdout(), to_zed_rx));
+    let c2s = tokio::spawn(c2s_task(
+        to_server_tx,
+        pending.clone(),
+        cursor_tx,
+        init_tx,
+        state.clone(),
+        documents,
+        inlay_requests,
+        lens_requests,
+        handle.clone(),
+    ));
+    tokio::spawn(s2c_task(child_stdout, to_zed_tx, pending, state));
 
-    (LspHandle { inner }, c2s)
+    (handle, c2s)
 }
 
-async fn writer_task(mut child_stdin: ChildStdin, mut rx: mpsc::Receiver<Vec<u8>>) {
+async fn server_writer_task(mut child_stdin: ChildStdin, mut rx: mpsc::Receiver<Vec<u8>>) {
     while let Some(frame) = rx.recv().await {
         if child_stdin.write_all(&frame).await.is_err() {
             break;
@@ -167,22 +251,102 @@ async fn writer_task(mut child_stdin: ChildStdin, mut rx: mpsc::Receiver<Vec<u8>
     }
 }
 
+async fn zed_writer_task(mut stdout: Stdout, mut rx: mpsc::Receiver<Vec<u8>>) {
+    while let Some(frame) = rx.recv().await {
+        if stdout.write_all(&frame).await.is_err() {
+            break;
+        }
+        if stdout.flush().await.is_err() {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn c2s_task(
     to_server: mpsc::Sender<Vec<u8>>,
+    pending: Arc<Mutex<Pending>>,
     cursor_tx: watch::Sender<Option<CursorPos>>,
     init_tx: watch::Sender<bool>,
+    state: StateHandle,
+    documents: Documents,
+    inlay_requests: mpsc::Sender<InlayRequest>,
+    lens_requests: mpsc::Sender<CodeLensRequest>,
+    handle: LspHandle,
 ) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     loop {
         match read_message(&mut reader).await {
             Ok(Some((hdr, body))) => {
+                let parsed: Option<Value> = serde_json::from_slice(&body).ok();
+                if let Some(ref v) = parsed
+                    && let Some(id) = v.get("id").and_then(Value::as_str)
+                    && id.starts_with(ID_PREFIX)
+                    && v.get("method").is_none()
+                {
+                    let waiter = pending.lock().expect("pending mutex poisoned").remove(id);
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(extract_result(v));
+                    }
+                    continue;
+                }
+                if let Some(ref v) = parsed
+                    && v.get("method").and_then(Value::as_str) == Some("textDocument/inlayHint")
+                    && v.get("id").is_some()
+                {
+                    let id = v.get("id").cloned().unwrap_or(Value::Null);
+                    let params = v.get("params").cloned().unwrap_or(Value::Null);
+                    let _ = inlay_requests.send(InlayRequest { id, params }).await;
+                    continue;
+                }
+                if let Some(ref v) = parsed
+                    && v.get("method").and_then(Value::as_str) == Some("textDocument/codeLens")
+                    && v.get("id").is_some()
+                {
+                    let id = v.get("id").cloned().unwrap_or(Value::Null);
+                    let params = v.get("params").cloned().unwrap_or(Value::Null);
+                    let _ = lens_requests.send(CodeLensRequest { id, params }).await;
+                    continue;
+                }
+                if let Some(ref v) = parsed
+                    && v.get("method").and_then(Value::as_str) == Some("textDocument/hover")
+                    && let Some(id) = v.get("id").cloned()
+                    && let Some(uri) = v
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                    && let Some(line) = v.pointer("/params/position/line").and_then(Value::as_u64)
+                    && let Some(character) = v
+                        .pointer("/params/position/character")
+                        .and_then(Value::as_u64)
+                {
+                    let handle = handle.clone();
+                    let uri = uri.to_string();
+                    tokio::spawn(async move {
+                        merge_hover(handle, id, uri, line, character).await;
+                    });
+                    continue;
+                }
                 if let Some(pos) = snoop::extract_cursor(&body) {
                     let _ = cursor_tx.send(Some(pos));
                 }
                 if snoop::is_initialized(&body) {
                     let _ = init_tx.send(true);
                 }
+                if let Some(uri) = snoop::extract_did_open(&body) {
+                    state.note_did_open(uri);
+                }
+                if let Some(uri) = snoop::extract_did_close(&body) {
+                    state.note_did_close(uri).await;
+                }
+                if let Some((uri, ver)) = snoop::extract_did_open_version(&body) {
+                    state.update_version(uri, ver).await;
+                }
+                if let Some((uri, ver)) = snoop::extract_did_change(&body) {
+                    state.update_version(uri, ver).await;
+                }
+                documents.handle_message(&body).await;
+
                 let mut frame = hdr;
                 frame.extend_from_slice(&body);
                 if to_server.send(frame).await.is_err() {
@@ -198,32 +362,25 @@ async fn c2s_task(
     }
 }
 
-async fn s2c_task(child_stdout: ChildStdout, pending: Arc<Mutex<Pending>>, state: StateHandle) {
+async fn s2c_task(
+    child_stdout: ChildStdout,
+    to_zed: mpsc::Sender<Vec<u8>>,
+    pending: Arc<Mutex<Pending>>,
+    state: StateHandle,
+) {
     let mut reader = BufReader::new(child_stdout);
-    let mut zed_stdout = tokio::io::stdout();
     loop {
         match read_message(&mut reader).await {
             Ok(Some((hdr, body))) => {
                 let parsed: Option<Value> = serde_json::from_slice(&body).ok();
-
                 if let Some(ref v) = parsed
                     && let Some(id) = v.get("id").and_then(Value::as_str)
                     && id.starts_with(ID_PREFIX)
+                    && v.get("method").is_none()
                 {
                     let waiter = pending.lock().expect("pending mutex poisoned").remove(id);
                     if let Some(tx) = waiter {
-                        let result = if let Some(err) = v.get("error") {
-                            let code = err.get("code").and_then(Value::as_i64).unwrap_or(-1);
-                            let msg = err
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            Err(ResponseError { code, message: msg })
-                        } else {
-                            Ok(v.get("result").cloned().unwrap_or(Value::Null))
-                        };
-                        let _ = tx.send(result);
+                        let _ = tx.send(extract_result(v));
                     }
                     continue;
                 }
@@ -235,14 +392,54 @@ async fn s2c_task(child_stdout: ChildStdout, pending: Arc<Mutex<Pending>>, state
                 {
                     state.update_progress(uri.to_string(), params.clone()).await;
                 }
+                if let Some(ref v) = parsed
+                    && v.get("method").and_then(Value::as_str)
+                        == Some("textDocument/publishDiagnostics")
+                    && let Some(params) = v.get("params")
+                    && let Some(uri) = params.pointer("/uri").and_then(Value::as_str)
+                {
+                    let diags = params
+                        .get("diagnostics")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    state.update_diagnostics(uri.to_string(), diags).await;
+                }
+                if let Some(ref v) = parsed
+                    && v.get("id").is_some()
+                    && let Some(result) = v.get("result")
+                    && result.is_object()
+                {
+                    let keys: Vec<&str> = result
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    eprintln!(
+                        "[proxy] s2c response id={:?} result.keys={:?}",
+                        v.get("id"),
+                        keys
+                    );
+                }
 
-                if zed_stdout.write_all(&hdr).await.is_err() {
-                    break;
-                }
-                if zed_stdout.write_all(&body).await.is_err() {
-                    break;
-                }
-                if zed_stdout.flush().await.is_err() {
+                let (out_hdr, out_body) = if let Some(ref v) = parsed
+                    && is_initialize_response(v)
+                    && let Some(modified) = maybe_inject_inlay_capability(v.clone())
+                {
+                    eprintln!("[proxy] injected inlayHintProvider & codeLensProvider capabilities");
+                    let new_body = serde_json::to_vec(&modified)
+                        .expect("serialize modified initialize response");
+                    let new_hdr =
+                        format!("Content-Length: {}\r\n\r\n", new_body.len()).into_bytes();
+                    (new_hdr, new_body)
+                } else {
+                    (hdr, body)
+                };
+
+                let mut frame = out_hdr;
+                frame.extend_from_slice(&out_body);
+                if to_zed.send(frame).await.is_err() {
                     break;
                 }
             }
@@ -260,4 +457,136 @@ async fn s2c_task(child_stdout: ChildStdout, pending: Arc<Mutex<Pending>>, state
             message: "server connection closed".into(),
         }));
     }
+}
+
+fn extract_result(v: &Value) -> Result<Value, ResponseError> {
+    if let Some(err) = v.get("error") {
+        let code = err.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        let message = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Err(ResponseError { code, message })
+    } else {
+        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+    }
+}
+
+fn is_initialize_response(v: &Value) -> bool {
+    v.pointer("/result/capabilities")
+        .is_some_and(Value::is_object)
+}
+
+async fn merge_hover(
+    handle: LspHandle,
+    original_id: Value,
+    uri: String,
+    line: u64,
+    character: u64,
+) {
+    use std::time::Duration;
+    let hover_id = handle.alloc_id();
+    let goal_id = handle.alloc_id();
+    let hover_params = json!({
+        "textDocument": { "uri": &uri },
+        "position": { "line": line, "character": character },
+    });
+    let goal_params = hover_params.clone();
+
+    let hover_fut = handle.request_with_id(&hover_id, "textDocument/hover", hover_params);
+    let goal_fut = handle.request_with_id(&goal_id, "$/lean/plainGoal", goal_params);
+    let goal_with_timeout = tokio::time::timeout(Duration::from_millis(500), goal_fut);
+
+    let (hover_res, goal_res) = tokio::join!(hover_fut, goal_with_timeout);
+    let hover_value = hover_res.unwrap_or(Value::Null);
+    let goal_value = match goal_res {
+        Ok(Ok(v)) => v,
+        _ => Value::Null,
+    };
+
+    let merged = merge_hover_value(hover_value, &goal_value);
+    let _ = handle.respond_to_client(original_id, merged).await;
+}
+
+fn merge_hover_value(mut hover: Value, goal: &Value) -> Value {
+    let goal_md = goal_to_markdown(goal);
+    if goal_md.is_empty() {
+        return hover;
+    }
+
+    let block = format!("\n\n---\n\n**Goal at this position:**\n\n{goal_md}");
+
+    if hover.is_null() {
+        return json!({
+            "contents": { "kind": "markdown", "value": block.trim_start().to_string() }
+        });
+    }
+
+    if let Some(obj) = hover.as_object_mut() {
+        match obj.get_mut("contents") {
+            Some(Value::Object(mc)) => {
+                if let Some(Value::String(v)) = mc.get_mut("value") {
+                    v.push_str(&block);
+                }
+                if !mc.contains_key("kind") {
+                    mc.insert("kind".to_string(), json!("markdown"));
+                }
+            }
+            Some(Value::String(s)) => {
+                let combined = format!("{s}{block}");
+                obj.insert(
+                    "contents".to_string(),
+                    json!({ "kind": "markdown", "value": combined }),
+                );
+            }
+            Some(Value::Array(arr)) => {
+                arr.push(json!({ "language": "markdown", "value": block }));
+            }
+            _ => {
+                obj.insert(
+                    "contents".to_string(),
+                    json!({ "kind": "markdown", "value": block.trim_start().to_string() }),
+                );
+            }
+        }
+    }
+    hover
+}
+
+fn goal_to_markdown(goal: &Value) -> String {
+    if goal.is_null() {
+        return String::new();
+    }
+    if let Some(rendered) = goal.get("rendered").and_then(Value::as_str)
+        && !rendered.is_empty()
+    {
+        return rendered.to_string();
+    }
+    if let Some(arr) = goal.get("goals").and_then(Value::as_array) {
+        let parts: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|g| format!("```lean\n{g}\n```"))
+            .collect();
+        return parts.join("\n\n");
+    }
+    String::new()
+}
+
+fn maybe_inject_inlay_capability(mut v: Value) -> Option<Value> {
+    let caps = v.pointer_mut("/result/capabilities")?.as_object_mut()?;
+    let mut changed = false;
+    if !caps.contains_key("inlayHintProvider") {
+        caps.insert("inlayHintProvider".to_string(), json!(true));
+        changed = true;
+    }
+    if !caps.contains_key("codeLensProvider") {
+        caps.insert(
+            "codeLensProvider".to_string(),
+            json!({ "resolveProvider": false }),
+        );
+        changed = true;
+    }
+    if changed { Some(v) } else { None }
 }

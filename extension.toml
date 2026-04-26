@@ -5,7 +5,7 @@ version = "0.1.0"
 schema_version = 1
 authors = ["Gabriel <gabriel@minatel.dev>"]
 repository = "https://github.com/SrGaabriel/lean-to"
-snippets = "snippets/lean4.json"
+snippets = "snippets/lean 4.json"
 
 [language_servers.lean-to-proxy]
 name = "Lean-to Proxy"

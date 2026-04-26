@@ -1,62 +1,93 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::{
-    lsp::{ERROR_CANCELLED, LspHandle},
+    lean_rpc::RpcManager,
+    lsp::ERROR_CANCELLED,
     snoop::CursorPos,
-    state::StateHandle,
+    state::{StateEvent, StateHandle},
 };
 
 const DEBOUNCE: Duration = Duration::from_millis(120);
 
-pub fn spawn(lsp: LspHandle, cursor_rx: watch::Receiver<Option<CursorPos>>, state: StateHandle) {
-    tokio::spawn(run(lsp, cursor_rx, state));
+pub fn spawn(
+    rpc: Arc<RpcManager>,
+    cursor_rx: watch::Receiver<Option<CursorPos>>,
+    state: StateHandle,
+) {
+    tokio::spawn(run(rpc, cursor_rx, state));
 }
 
 async fn run(
-    lsp: LspHandle,
+    rpc: Arc<RpcManager>,
     mut cursor_rx: watch::Receiver<Option<CursorPos>>,
     state: StateHandle,
 ) {
-    lsp.wait_initialized().await;
+    rpc.lsp().wait_initialized().await;
     eprintln!("[goals] initialized; tracking cursor");
 
     let _ = cursor_rx.borrow_and_update();
 
+    let mut events = state.subscribe();
     let mut prev_id: Option<String> = None;
     let mut prev_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut last_fired: Option<CursorPos> = None;
 
     loop {
-        let Some(pos) = next_settled_cursor(&mut cursor_rx).await else {
-            return;
+        let signal = tokio::select! {
+            r = cursor_rx.changed() => match r {
+                Ok(()) => {
+                    settle_cursor(&mut cursor_rx).await;
+                    Signal::Cursor
+                }
+                Err(_) => return,
+            },
+            r = events.recv() => match r {
+                Ok(StateEvent::ProgressChanged { uri }) => Signal::Progress(uri),
+                Ok(StateEvent::DidClose { uri }) => Signal::DidClose(uri),
+                Ok(StateEvent::DidOpen { .. } | StateEvent::DiagnosticsChanged { .. })
+                | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            },
         };
 
-        if let Some(prev) = prev_id.take() {
-            lsp.cancel(&prev).await;
-        }
-        if let Some(h) = prev_handle.take() {
-            h.abort();
+        let pos = cursor_rx.borrow().clone();
+        let Some(pos) = pos else { continue };
+
+        if let Signal::DidClose(uri) = &signal
+            && pos.uri == *uri
+        {
+            cancel_inflight(&rpc, &mut prev_id, &mut prev_handle).await;
+            last_fired = None;
+            continue;
         }
 
-        let id = lsp.alloc_id();
+        if let Signal::Progress(uri) = &signal
+            && pos.uri != *uri
+        {
+            continue;
+        }
+
+        if state.is_processing(&pos.uri, pos.line).await {
+            continue;
+        }
+
+        if !matches!(signal, Signal::Cursor) && last_fired.as_ref() == Some(&pos) {
+            continue;
+        }
+
+        cancel_inflight(&rpc, &mut prev_id, &mut prev_handle).await;
+
+        let id = rpc.lsp().alloc_id();
         prev_id = Some(id.clone());
+        last_fired = Some(pos.clone());
 
-        let lsp = lsp.clone();
+        let rpc = rpc.clone();
         let state = state.clone();
         prev_handle = Some(tokio::spawn(async move {
-            let params = json!({
-                "textDocument": { "uri": &pos.uri },
-                "position": { "line": pos.line, "character": pos.character },
-            });
-            match lsp.request_with_id(&id, "$/lean/plainGoal", params).await {
+            match rpc.call_at(&pos.uri, pos.line, pos.character, &id).await {
                 Ok(result) => {
-                    let goals = goals(&result);
-                    eprintln!(
-                        "[goals] {} {}:{} → {}",
-                        pos.uri, pos.line, pos.character, goals
-                    );
                     state
                         .update_goals(&pos.uri, pos.line, pos.character, result)
                         .await;
@@ -70,25 +101,31 @@ async fn run(
     }
 }
 
-async fn next_settled_cursor(rx: &mut watch::Receiver<Option<CursorPos>>) -> Option<CursorPos> {
-    loop {
-        rx.changed().await.ok()?;
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(DEBOUNCE) => break,
-                r = rx.changed() => { r.ok()?; }
-            }
-        }
-        if let Some(pos) = rx.borrow_and_update().clone() {
-            return Some(pos);
-        }
+enum Signal {
+    Cursor,
+    Progress(String),
+    DidClose(String),
+}
+
+async fn cancel_inflight(
+    rpc: &Arc<RpcManager>,
+    prev_id: &mut Option<String>,
+    prev_handle: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(prev) = prev_id.take() {
+        rpc.lsp().cancel(&prev).await;
+    }
+    if let Some(h) = prev_handle.take() {
+        h.abort();
     }
 }
 
-fn goals(result: &Value) -> String {
-    if result.is_null() {
-        return "no goals".into();
+async fn settle_cursor(rx: &mut watch::Receiver<Option<CursorPos>>) {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(DEBOUNCE) => break,
+            r = rx.changed() => if r.is_err() { break; },
+        }
     }
-    let n = result.get("goals").and_then(Value::as_array);
-    serde_json::to_string(&n).unwrap_or_else(|_| "invalid goals".into())
+    let _ = rx.borrow_and_update();
 }
