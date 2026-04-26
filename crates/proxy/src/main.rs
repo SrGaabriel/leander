@@ -1,9 +1,12 @@
+mod framing;
+mod goals;
+mod lsp;
+mod snoop;
+mod state;
+
 use std::{env, process::Stdio};
 
-use tokio::{
-    io::{self, copy},
-    process::Command,
-};
+use tokio::{io, process::Command, sync::watch};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -13,9 +16,7 @@ async fn main() -> io::Result<()> {
         .find(|w| w[0] == "--lsp")
         .and_then(|w| w.get(1))
         .expect("Usage: proxy --lsp <path_to_lsp>");
-    eprintln!("LSP path: {lsp_arg}");
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    eprintln!("[proxy] launching: {lsp_arg} serve");
 
     let mut child = Command::new(lsp_arg)
         .arg("serve")
@@ -25,22 +26,26 @@ async fn main() -> io::Result<()> {
         .spawn()
         .expect("Failed to launch LSP server");
 
-    let mut child_stdin = child.stdin.take().expect("Failed to open stdin");
-    let mut child_stdout = child.stdout.take().expect("Failed to open stdout");
+    let child_stdin = child.stdin.take().expect("child stdin");
+    let child_stdout = child.stdout.take().expect("child stdout");
 
-    let stdin_to_child = copy(&mut stdin, &mut child_stdin);
-    let child_to_stdout = copy(&mut child_stdout, &mut stdout);
+    let state = state::StateHandle::new();
+    let (cursor_tx, cursor_rx) = watch::channel(None);
+
+    let (lsp_handle, c2s_done) = lsp::spawn(child_stdin, child_stdout, cursor_tx, state.clone());
+    goals::spawn(lsp_handle, cursor_rx, state);
 
     tokio::select! {
-        r = stdin_to_child => { r?; }
-        r = child_to_stdout => { r?; }
+        _ = c2s_done => {
+            eprintln!("[proxy] zed closed stdin");
+        }
         status = child.wait() => {
             let status = status?;
+            eprintln!("[proxy] lake exited: {status}");
             std::process::exit(status.code().unwrap_or(1));
         }
     }
 
-    drop(child_stdin);
     let _ = child.wait().await;
     Ok(())
 }

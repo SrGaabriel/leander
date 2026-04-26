@@ -11,7 +11,7 @@ snippets = "snippets/lean4.json"
 name = "Lean-to Proxy"
 languages = ["Lean 4"]
 
-[grammars.lean4]
+[grammars.lean]
 repository = "https://github.com/Julian/tree-sitter-lean"
 rev = "efe6b87145608d12f5996bd7f0cf6095a0e82261"
 
