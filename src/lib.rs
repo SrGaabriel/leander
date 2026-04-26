@@ -2,6 +2,8 @@ use std::{fs, path::PathBuf};
 
 use zed_extension_api::{self as zed, Result, serde_json::Value, settings::LspSettings};
 
+const PROXY_REPO: &str = "SrGaabriel/lean-to";
+
 struct LeanToExtension;
 
 impl LeanToExtension {
@@ -103,7 +105,7 @@ impl LeanToExtension {
             .assets
             .iter()
             .find(|asset| asset.name == asset_name)
-            .ok_or_else(|| format!("No asset found matching: {:?}", asset_name))?;
+            .ok_or_else(|| format!("No asset found matching: {asset_name:?}"))?;
 
         let version_dir = format!("elan-{}", release.version);
         let elan_init_name = match platform {
@@ -142,6 +144,125 @@ impl LeanToExtension {
 
         Ok(elan_init_path_str)
     }
+
+    fn find_or_download_proxy(
+        &mut self,
+        language_server_id: &zed::LanguageServerId,
+    ) -> Result<String> {
+        let (platform, arch) = zed::current_platform();
+        let arch_str = match arch {
+            zed::Architecture::Aarch64 => "aarch64",
+            zed::Architecture::X8664 => "x86_64",
+            zed::Architecture::X86 => {
+                return Err("32-bit x86 architecture is not supported".into());
+            }
+        };
+        let platform_str = match platform {
+            zed::Os::Windows => "pc-windows-msvc",
+            zed::Os::Mac => "apple-darwin",
+            zed::Os::Linux => "unknown-linux-gnu",
+        };
+        let ext = if matches!(platform, zed::Os::Windows) {
+            ".exe"
+        } else {
+            ""
+        };
+        let asset_name = format!("lean-to-proxy-{arch_str}-{platform_str}{ext}");
+        let binary_name = format!("lean-to-proxy{ext}");
+
+        let cwd =
+            std::env::current_dir().map_err(|e| format!("Failed to get current directory: {e}"))?;
+
+        let release_result = zed::latest_github_release(
+            PROXY_REPO,
+            zed::GithubReleaseOptions {
+                require_assets: true,
+                pre_release: false,
+            },
+        );
+
+        let release = match release_result {
+            Ok(r) => r,
+            Err(release_err) => {
+                if let Some(cached) = find_latest_cached_proxy(&cwd, &binary_name) {
+                    return Ok(cached);
+                }
+                return Err(format!(
+                    "Failed to fetch latest lean-to release ({release_err})"
+                ));
+            }
+        };
+
+        let version_dir = cwd.join(format!("proxy-{}", release.version));
+        let proxy_path = version_dir.join(&binary_name);
+        let proxy_path_str = proxy_path.to_string_lossy().to_string();
+
+        if proxy_path.exists() {
+            return Ok(proxy_path_str);
+        }
+
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == asset_name)
+            .ok_or_else(|| {
+                format!(
+                    "lean-to release {} has no asset named {asset_name}",
+                    release.version
+                )
+            })?;
+
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::Downloading,
+        );
+        fs::create_dir_all(&version_dir).map_err(|e| format!("Failed to create proxy dir: {e}"))?;
+        zed::download_file(
+            &asset.download_url,
+            &proxy_path_str,
+            zed::DownloadedFileType::Uncompressed,
+        )
+        .map_err(|e| format!("Failed to download proxy: {e}"))?;
+        zed::make_file_executable(&proxy_path_str)?;
+
+        if let Ok(entries) = fs::read_dir(&cwd) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path != version_dir
+                    && path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("proxy-"))
+                {
+                    let _ = fs::remove_dir_all(&path);
+                }
+            }
+        }
+
+        Ok(proxy_path_str)
+    }
+}
+
+fn find_latest_cached_proxy(cwd: &PathBuf, binary_name: &str) -> Option<String> {
+    let entries = fs::read_dir(cwd).ok()?;
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("proxy-") || !path.is_dir() {
+                return None;
+            }
+            let bin = path.join(binary_name);
+            if !bin.exists() {
+                return None;
+            }
+            let mtime = entry.metadata().ok()?.modified().ok()?;
+            Some((mtime, bin))
+        })
+        .max_by_key(|(t, _)| *t)
+        .map(|(_, p)| p.to_string_lossy().into_owned())
 }
 
 impl zed::Extension for LeanToExtension {
@@ -151,12 +272,13 @@ impl zed::Extension for LeanToExtension {
 
     fn language_server_command(
         &mut self,
-        _language_server_id: &zed::LanguageServerId,
-        _worktree: &zed::Worktree,
+        language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        let lean4_lsp_path = self.find_lean4_lsp(_language_server_id, _worktree)?;
+        let lean4_lsp_path = self.find_lean4_lsp(language_server_id, worktree)?;
+        let proxy_path = self.find_or_download_proxy(language_server_id)?;
         Ok(zed::Command {
-            command: r"C:\Users\gabriel\Developer\lean-to\target\debug\proxy.exe".to_string(),
+            command: proxy_path,
             args: vec!["--lsp".to_string(), lean4_lsp_path],
             env: vec![],
         })
