@@ -38,6 +38,7 @@ struct Inner {
     progress: HashMap<String, Value>,
     versions: HashMap<String, i64>,
     diagnostics: HashMap<String, Vec<Value>>,
+    semantic_token_types: Vec<String>,
 }
 
 impl StateHandle {
@@ -135,6 +136,37 @@ impl StateHandle {
             return false;
         };
         line_in_processing(progress, line)
+    }
+
+    pub async fn set_semantic_token_types(&self, types: Vec<String>) {
+        self.inner.lock().await.semantic_token_types = types;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn token_type_index(&self, name: &str) -> Option<u32> {
+        let inner = self.inner.lock().await;
+        inner
+            .semantic_token_types
+            .iter()
+            .position(|t| t == name)
+            .map(|i| i as u32)
+    }
+
+    pub async fn elaboration_frontier(&self, uri: &str) -> u64 {
+        let inner = self.inner.lock().await;
+        let Some(progress) = inner.progress.get(uri) else {
+            return u64::MAX;
+        };
+        let Some(arr) = progress.get("processing").and_then(Value::as_array) else {
+            return u64::MAX;
+        };
+        if arr.is_empty() {
+            return u64::MAX;
+        }
+        arr.iter()
+            .filter_map(|item| item.pointer("/range/start/line").and_then(Value::as_u64))
+            .min()
+            .unwrap_or(u64::MAX)
     }
 }
 

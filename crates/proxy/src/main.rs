@@ -7,6 +7,9 @@ mod goals;
 mod inlay;
 mod lean_rpc;
 mod lsp;
+mod progress;
+mod restart;
+mod semantic_tokens;
 mod snoop;
 mod state;
 
@@ -44,6 +47,7 @@ async fn main() -> io::Result<()> {
     let (cursor_tx, cursor_rx) = watch::channel(None);
     let (inlay_requests_tx, inlay_requests_rx) = mpsc::channel(64);
     let (lens_requests_tx, lens_requests_rx) = mpsc::channel(64);
+    let (semantic_requests_tx, semantic_requests_rx) = mpsc::channel(64);
 
     let (lsp_handle, c2s_done) = lsp::spawn(
         child_stdin,
@@ -53,6 +57,7 @@ async fn main() -> io::Result<()> {
         documents.clone(),
         inlay_requests_tx,
         lens_requests_tx,
+        semantic_requests_tx,
     );
     let rpc = lean_rpc::RpcManager::new(lsp_handle.clone(), &state);
     goals::spawn(rpc, cursor_rx, state.clone());
@@ -62,7 +67,20 @@ async fn main() -> io::Result<()> {
         documents.clone(),
         inlay_requests_rx,
     );
-    code_lens::spawn(lsp_handle, state, documents, lens_requests_rx);
+    code_lens::spawn(
+        lsp_handle.clone(),
+        state.clone(),
+        documents.clone(),
+        lens_requests_rx,
+    );
+    semantic_tokens::spawn(
+        lsp_handle.clone(),
+        state.clone(),
+        documents.clone(),
+        semantic_requests_rx,
+    );
+    progress::spawn(lsp_handle.clone(), state.clone(), documents.clone());
+    restart::spawn(lsp_handle, state, documents);
 
     tokio::select! {
         _ = c2s_done => {

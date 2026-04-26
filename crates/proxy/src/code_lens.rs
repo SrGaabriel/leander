@@ -91,7 +91,6 @@ impl CodeLens {
             .lock()
             .await
             .insert(uri.clone(), lenses.len());
-        eprintln!("[lens] {} → {} lenses", uri, lenses.len());
         let _ = self
             .lsp
             .respond_to_client(req.id, Value::Array(lenses))

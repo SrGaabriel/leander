@@ -25,8 +25,6 @@ async fn run(
     state: StateHandle,
 ) {
     rpc.lsp().wait_initialized().await;
-    eprintln!("[goals] initialized; tracking cursor");
-
     let _ = cursor_rx.borrow_and_update();
 
     let mut events = state.subscribe();

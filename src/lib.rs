@@ -155,8 +155,6 @@ impl zed::Extension for LeanToExtension {
         _worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
         let lean4_lsp_path = self.find_lean4_lsp(_language_server_id, _worktree)?;
-        println!("Using Lean 4 LSP at: {lean4_lsp_path}");
-        eprintln!("Using Lean 4 LSP at: {lean4_lsp_path}");
         Ok(zed::Command {
             command: r"C:\Users\gabriel\Developer\lean-to\target\debug\proxy.exe".to_string(),
             args: vec!["--lsp".to_string(), lean4_lsp_path],

@@ -62,7 +62,19 @@ fn spawn_refresh_worker(inlay: Arc<Inlay>, state: StateHandle) {
         loop {
             tokio::select! {
                 ev = events.recv() => match ev {
-                    Ok(StateEvent::ProgressChanged { .. } | StateEvent::DiagnosticsChanged { .. }) => {
+                    Ok(StateEvent::ProgressChanged { uri }) => {
+                        let frontier = inlay.state.elaboration_frontier(&uri).await;
+                        if frontier == u64::MAX {
+                            pending = false;
+                            let _ = inlay
+                                .lsp
+                                .request_client("workspace/inlayHint/refresh", json!(null))
+                                .await;
+                        } else {
+                            pending = true;
+                        }
+                    }
+                    Ok(StateEvent::DiagnosticsChanged { .. }) => {
                         pending = true;
                     }
                     Ok(StateEvent::DidClose { uri }) => {
@@ -107,16 +119,7 @@ async fn handle_request(inlay: Arc<Inlay>, req: InlayRequest) {
         .and_then(Value::as_u64)
         .unwrap_or(start_line);
 
-    let started = std::time::Instant::now();
     let hints = compute_hints_concurrently(inlay.clone(), &uri, start_line, end_line).await;
-    eprintln!(
-        "[inlay] {} lines {}..={} → {} hints in {:?}",
-        uri,
-        start_line,
-        end_line,
-        hints.len(),
-        started.elapsed(),
-    );
     let _ = inlay
         .lsp
         .respond_to_client(req.id, Value::Array(hints))
@@ -131,11 +134,12 @@ async fn compute_hints_concurrently(
 ) -> Vec<Value> {
     use tokio::task::JoinSet;
 
+    let frontier = inlay.state.elaboration_frontier(uri).await;
     let mut set: JoinSet<Option<Vec<Value>>> = JoinSet::new();
     for line in start_line..=end_line {
         let inlay = inlay.clone();
         let uri = uri.to_string();
-        set.spawn(async move { hints_for_line(inlay, uri, line).await });
+        set.spawn(async move { hints_for_line(inlay, uri, line, frontier).await });
     }
 
     let mut grouped: Vec<(u64, Vec<Value>)> = Vec::new();
@@ -153,21 +157,28 @@ async fn compute_hints_concurrently(
     grouped.into_iter().flat_map(|(_, h)| h).collect()
 }
 
-async fn hints_for_line(inlay: Arc<Inlay>, uri: String, line: u64) -> Option<Vec<Value>> {
+async fn hints_for_line(
+    inlay: Arc<Inlay>,
+    uri: String,
+    line: u64,
+    frontier: u64,
+) -> Option<Vec<Value>> {
     let line_text = inlay.documents.line_text(&uri, line).await?;
     let trimmed = line_text.trim_start();
     let line_len = inlay.documents.line_length_utf16(&uri, line).await?;
 
     let mut out = Vec::new();
-    let probe_eligible =
-        !trimmed.is_empty() && !trimmed.starts_with("--") && !trimmed.starts_with("/-");
+    let probe_eligible = line < frontier
+        && !trimmed.is_empty()
+        && !trimmed.starts_with("--")
+        && !trimmed.starts_with("/-");
 
     let entering = if probe_eligible {
         inlay.probe(&uri, line, 0).await
     } else {
         None
     };
-    let exiting = if probe_eligible {
+    let exiting = if probe_eligible && entering.is_some() {
         inlay.probe(&uri, line, line_len).await
     } else {
         None

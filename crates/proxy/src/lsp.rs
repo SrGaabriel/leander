@@ -44,6 +44,12 @@ pub struct CodeLensRequest {
     pub params: Value,
 }
 
+#[derive(Debug)]
+pub struct SemanticTokensRequest {
+    pub id: Value,
+    pub params: Value,
+}
+
 #[derive(Clone)]
 pub struct LspHandle {
     inner: Arc<Inner>,
@@ -197,6 +203,7 @@ async fn send_notification(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     child_stdin: ChildStdin,
     child_stdout: ChildStdout,
@@ -205,6 +212,7 @@ pub fn spawn(
     documents: Documents,
     inlay_requests: mpsc::Sender<InlayRequest>,
     lens_requests: mpsc::Sender<CodeLensRequest>,
+    semantic_requests: mpsc::Sender<SemanticTokensRequest>,
 ) -> (LspHandle, tokio::task::JoinHandle<()>) {
     let (to_server_tx, to_server_rx) = mpsc::channel::<Vec<u8>>(64);
     let (to_zed_tx, to_zed_rx) = mpsc::channel::<Vec<u8>>(64);
@@ -233,6 +241,7 @@ pub fn spawn(
         documents,
         inlay_requests,
         lens_requests,
+        semantic_requests,
         handle.clone(),
     ));
     tokio::spawn(s2c_task(child_stdout, to_zed_tx, pending, state));
@@ -272,6 +281,7 @@ async fn c2s_task(
     documents: Documents,
     inlay_requests: mpsc::Sender<InlayRequest>,
     lens_requests: mpsc::Sender<CodeLensRequest>,
+    semantic_requests: mpsc::Sender<SemanticTokensRequest>,
     handle: LspHandle,
 ) {
     let stdin = tokio::io::stdin();
@@ -310,6 +320,18 @@ async fn c2s_task(
                     continue;
                 }
                 if let Some(ref v) = parsed
+                    && v.get("method").and_then(Value::as_str)
+                        == Some("textDocument/semanticTokens/full")
+                    && v.get("id").is_some()
+                {
+                    let id = v.get("id").cloned().unwrap_or(Value::Null);
+                    let params = v.get("params").cloned().unwrap_or(Value::Null);
+                    let _ = semantic_requests
+                        .send(SemanticTokensRequest { id, params })
+                        .await;
+                    continue;
+                }
+                if let Some(ref v) = parsed
                     && v.get("method").and_then(Value::as_str) == Some("textDocument/hover")
                     && let Some(id) = v.get("id").cloned()
                     && let Some(uri) = v
@@ -321,9 +343,10 @@ async fn c2s_task(
                         .and_then(Value::as_u64)
                 {
                     let handle = handle.clone();
+                    let state = state.clone();
                     let uri = uri.to_string();
                     tokio::spawn(async move {
-                        merge_hover(handle, id, uri, line, character).await;
+                        merge_hover(handle, state, id, uri, line, character).await;
                     });
                     continue;
                 }
@@ -405,22 +428,19 @@ async fn s2c_task(
                         .unwrap_or_default();
                     state.update_diagnostics(uri.to_string(), diags).await;
                 }
+
                 if let Some(ref v) = parsed
-                    && v.get("id").is_some()
-                    && let Some(result) = v.get("result")
-                    && result.is_object()
+                    && is_initialize_response(v)
+                    && let Some(types) = v
+                        .pointer("/result/capabilities/semanticTokensProvider/legend/tokenTypes")
+                        .and_then(Value::as_array)
                 {
-                    let keys: Vec<&str> = result
-                        .as_object()
-                        .unwrap()
-                        .keys()
-                        .map(String::as_str)
+                    let names: Vec<String> = types
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
                         .collect();
-                    eprintln!(
-                        "[proxy] s2c response id={:?} result.keys={:?}",
-                        v.get("id"),
-                        keys
-                    );
+                    state.set_semantic_token_types(names).await;
                 }
 
                 let (out_hdr, out_body) = if let Some(ref v) = parsed
@@ -480,29 +500,40 @@ fn is_initialize_response(v: &Value) -> bool {
 
 async fn merge_hover(
     handle: LspHandle,
+    state: StateHandle,
     original_id: Value,
     uri: String,
     line: u64,
     character: u64,
 ) {
     use std::time::Duration;
+
     let hover_id = handle.alloc_id();
-    let goal_id = handle.alloc_id();
     let hover_params = json!({
         "textDocument": { "uri": &uri },
         "position": { "line": line, "character": character },
     });
-    let goal_params = hover_params.clone();
-
     let hover_fut = handle.request_with_id(&hover_id, "textDocument/hover", hover_params);
-    let goal_fut = handle.request_with_id(&goal_id, "$/lean/plainGoal", goal_params);
-    let goal_with_timeout = tokio::time::timeout(Duration::from_millis(500), goal_fut);
+    let frontier = state.elaboration_frontier(&uri).await;
+    let in_progress = state.is_processing(&uri, line).await;
+    let goal_worth_querying = line < frontier && !in_progress;
 
-    let (hover_res, goal_res) = tokio::join!(hover_fut, goal_with_timeout);
-    let hover_value = hover_res.unwrap_or(Value::Null);
-    let goal_value = match goal_res {
-        Ok(Ok(v)) => v,
-        _ => Value::Null,
+    let (hover_value, goal_value) = if goal_worth_querying {
+        let goal_id = handle.alloc_id();
+        let goal_params = json!({
+            "textDocument": { "uri": &uri },
+            "position": { "line": line, "character": character },
+        });
+        let goal_fut = handle.request_with_id(&goal_id, "$/lean/plainGoal", goal_params);
+        let goal_with_timeout = tokio::time::timeout(Duration::from_millis(150), goal_fut);
+        let (h, g) = tokio::join!(hover_fut, goal_with_timeout);
+        let goal = match g {
+            Ok(Ok(v)) => v,
+            _ => Value::Null,
+        };
+        (h.unwrap_or(Value::Null), goal)
+    } else {
+        (hover_fut.await.unwrap_or(Value::Null), Value::Null)
     };
 
     let merged = merge_hover_value(hover_value, &goal_value);

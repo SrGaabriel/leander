@@ -58,6 +58,12 @@ impl Documents {
         docs.get(uri).map(|d| d.text.clone())
     }
 
+    pub async fn line_count(&self, uri: &str) -> Option<u64> {
+        let docs = self.inner.read().await;
+        docs.get(uri)
+            .map(|d| (d.text.split('\n').count() as u64).max(1))
+    }
+
     async fn do_open(&self, params: &Value) {
         let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) else {
             return;
