@@ -1,6 +1,148 @@
-use zed_extension_api::{self as zed, Result};
+use std::{fs, path::PathBuf};
+
+use zed_extension_api::{self as zed, Result, serde_json::Value, settings::LspSettings};
 
 struct LeanToExtension;
+
+impl LeanToExtension {
+    fn find_lean4_lsp(
+        &mut self,
+        language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> Result<String> {
+        let shell_env = worktree.shell_env();
+        let lsp_settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
+
+        // Check lsp.lean4-lsp.binary
+        if let Some(binary) = lsp_settings.binary
+            && let Some(path) = binary.path
+        {
+            return Ok(path);
+        }
+
+        // Check $PATH
+        if let Some(path) = worktree.which("lake") {
+            return Ok(path);
+        }
+
+        // Check $ELAN_HOME or default directory
+        let elan_home = shell_env
+            .iter()
+            .find_map(|(k, v)| (k == "ELAN_HOME").then_some(PathBuf::from(v)))
+            .or_else(|| {
+                let home = shell_env
+                    .iter()
+                    .find_map(|(k, v)| (k == "HOME" || k == "USERPROFILE").then_some(v))?;
+                Some(PathBuf::from(home).join(".elan"))
+            })
+            .ok_or("Failed to find ELAN_HOME, HOME, or USERPROFILE")?;
+
+        let (platform, arch) = zed::current_platform();
+
+        let lake_path = elan_home.join("bin").join(match platform {
+            zed::Os::Windows => "lake.exe",
+            zed::Os::Mac | zed::Os::Linux => "lake",
+        });
+        let lake_path_str = lake_path.to_string_lossy().to_string();
+
+        if worktree.which(&lake_path_str).is_some() {
+            return Ok(lake_path_str);
+        }
+
+        // Check lsp.lean4-lsp.settings
+        let elan_auto_install = lsp_settings
+            .settings
+            .as_ref()
+            .and_then(|s| s.pointer("/elan_auto_install"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        if !elan_auto_install {
+            return Err(
+                        "Failed to find lake in PATH or ELAN_HOME/default path. Enable lsp.lean4-lsp.settings.elan_auto_install or configure lsp.lean4-lsp.binary.path."
+                            .into(),
+                    );
+        }
+
+        let elan_default_toolchain = lsp_settings
+            .settings
+            .as_ref()
+            .and_then(|s| s.pointer("/elan_default_toolchain"))
+            .and_then(Value::as_str)
+            .unwrap_or("stable");
+
+        // Install elan and lean 4 toolchain
+        let release = zed::latest_github_release(
+            "leanprover/elan",
+            zed::GithubReleaseOptions {
+                require_assets: true,
+                pre_release: false,
+            },
+        )?;
+
+        let asset_name: String = format!(
+            "elan-{}-{}.{}",
+            match arch {
+                zed::Architecture::Aarch64 => "aarch64",
+                zed::Architecture::X8664 => "x86_64",
+                zed::Architecture::X86 =>
+                    return Err("32-bit x86 architecture is not supported by elan".into()),
+            },
+            match platform {
+                zed::Os::Windows => "pc-windows-msvc",
+                zed::Os::Mac => "apple-darwin",
+                zed::Os::Linux => "unknown-linux-gnu",
+            },
+            match platform {
+                zed::Os::Windows => "zip",
+                zed::Os::Mac | zed::Os::Linux => "tar.gz",
+            },
+        );
+
+        let asset = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == asset_name)
+            .ok_or_else(|| format!("No asset found matching: {:?}", asset_name))?;
+
+        let version_dir = format!("elan-{}", release.version);
+        let elan_init_name = match platform {
+            zed::Os::Windows => "elan-init.exe",
+            zed::Os::Mac | zed::Os::Linux => "elan-init",
+        };
+
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::Downloading,
+        );
+        zed::download_file(
+            &asset.download_url,
+            &version_dir,
+            match platform {
+                zed::Os::Windows => zed::DownloadedFileType::Zip,
+                zed::Os::Mac | zed::Os::Linux => zed::DownloadedFileType::GzipTar,
+            },
+        )
+        .map_err(|e| format!("Failed to download file: {e}"))?;
+
+        let cwd =
+            std::env::current_dir().map_err(|e| format!("Failed to get current directory: {e}"))?;
+        let elan_init_path = cwd.join(&version_dir).join(elan_init_name);
+        let elan_init_path_str = elan_init_path.to_string_lossy().to_string();
+
+        zed::make_file_executable(&elan_init_path_str)?;
+        zed::Command::new(&elan_init_path_str)
+            .args([
+                "-y",
+                "--default-toolchain",
+                &format!("leanprover/lean4:{elan_default_toolchain}"),
+            ])
+            .output()?;
+        fs::remove_dir_all(&version_dir).ok();
+
+        Ok(elan_init_path_str)
+    }
+}
 
 impl zed::Extension for LeanToExtension {
     fn new() -> Self {
@@ -12,7 +154,14 @@ impl zed::Extension for LeanToExtension {
         _language_server_id: &zed::LanguageServerId,
         _worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        todo!()
+        let lean4_lsp_path = self.find_lean4_lsp(_language_server_id, _worktree)?;
+        println!("Using Lean 4 LSP at: {lean4_lsp_path}");
+        eprintln!("Using Lean 4 LSP at: {lean4_lsp_path}");
+        Ok(zed::Command {
+            command: r"C:\Users\gabriel\Developer\lean-to\target\debug\proxy.exe".to_string(),
+            args: vec!["--lsp".to_string(), lean4_lsp_path],
+            env: vec![],
+        })
     }
 }
 

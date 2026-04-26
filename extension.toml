@@ -5,13 +5,13 @@ version = "0.1.0"
 schema_version = 1
 authors = ["Gabriel <gabriel@minatel.dev>"]
 repository = "https://github.com/SrGaabriel/lean-to"
-snippets = "snippets/lean 4.json"
+snippets = "snippets/lean4.json"
 
-[language_servers.lean4-lsp]
-name = "Lean4 Language Server"
+[language_servers.lean-to-proxy]
+name = "Lean-to Proxy"
 languages = ["Lean 4"]
 
-[grammars.lean]
+[grammars.lean4]
 repository = "https://github.com/Julian/tree-sitter-lean"
 rev = "efe6b87145608d12f5996bd7f0cf6095a0e82261"
 
