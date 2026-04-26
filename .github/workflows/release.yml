@@ -7,7 +7,6 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release as (e.g. v0.1.0)"
         required: true
 
 permissions:
@@ -30,11 +29,11 @@ jobs:
             ext: ""
             cross: true
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
             ext: ""
             cross: false
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-26
             ext: ""
             cross: false
           - target: x86_64-pc-windows-msvc
