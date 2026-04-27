@@ -13,7 +13,7 @@ use crate::{
 
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
 
-const DECL_KEYWORDS: &[&str] = &["theorem", "lemma", "example", "def", "instance", "abbrev"];
+pub const DECL_KEYWORDS: &[&str] = &["theorem", "lemma", "example", "def", "instance", "abbrev"];
 
 pub fn spawn(
     lsp: LspHandle,

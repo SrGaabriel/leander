@@ -6,6 +6,8 @@ Since the official Lean 4 language server was built with VSCode and its flexible
 
 So `lean-to` makes Zed appear more capable to the official Lean 4 language server than it really is. In turn, the server sends more advanced requests, which `lean-to` intercepts and then converts into simpler messages that Zed can actually support.
 
+![Lean 4 in Zed](./assets/preview.png)
+
 ## How it works
 
 `lean-to` has its own language server that is a proxy between Zed and the official Lean 4 language server. Standing in the middle allows us to intercept certain requests/responses framing them more idiomatically.

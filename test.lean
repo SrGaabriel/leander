@@ -10,9 +10,10 @@ theorem add_zero (n : Nat) : n + 0 = n := by
   | zero => rfl
   | succ n ih =>
       have h₁ : Nat.succ n + 0 = Nat.succ (n + 0) := by
-        rfl
+        sorry
       have h₂ : Nat.succ (n + 0) = Nat.succ n := by
-        apply congrArg Nat.succ ih
+        apply congrArg Nat.succ
       have h₃ : Nat.succ n + 0 = Nat.succ n := by
         exact Eq.trans h₁ h₂
       exact h₃
+

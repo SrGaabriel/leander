@@ -6,14 +6,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    documents::Documents,
-    lsp::{LspHandle, SemanticTokensRequest},
-    state::StateHandle,
+    code_lens::DECL_KEYWORDS, documents::Documents, lsp::{LspHandle, SemanticTokensRequest}, state::StateHandle
 };
 
-const DECL_KEYWORDS: &[&str] = &[
-    "def", "theorem", "lemma", "example", "instance", "abbrev", "axiom",
-];
 
 #[derive(Clone, Copy, Debug)]
 struct Token {
