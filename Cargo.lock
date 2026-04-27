@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "infoview"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "itoa"
@@ -347,7 +347,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lean-to"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "zed_extension_api",
 ]
@@ -483,11 +483,11 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "proxy"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",

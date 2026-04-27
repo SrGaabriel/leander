@@ -75,18 +75,29 @@ async fn handle_request(
     };
 
     let mut tokens = decode_tokens(&lake);
-    if let Some(comment_idx) = state.token_type_index("comment").await
-        && let Some(doc_mod_idx) = state.token_modifier_index("documentation").await
-    {
-        let doc_bit = 1u32 << doc_mod_idx;
-        let ranges = scan_doc_comment_ranges(&text);
+    if let Some(comment_idx) = state.token_type_index("comment").await {
+        let doc_bit = state
+            .token_modifier_index("documentation")
+            .await
+            .map(|i| 1u32 << i);
+        let ranges = scan_comment_ranges(&text);
         let lines_with_lake_token: HashSet<u32> = tokens.iter().map(|t| t.line).collect();
-        for token in &mut tokens {
-            if ranges.iter().any(|r| r.covers(token.line, token.start)) {
-                token.modifiers |= doc_bit;
+
+        if let Some(doc_bit) = doc_bit {
+            for token in &mut tokens {
+                if ranges
+                    .iter()
+                    .any(|r| r.kind == CommentKind::Doc && r.covers(token.line, token.start))
+                {
+                    token.modifiers |= doc_bit;
+                }
             }
         }
         for range in &ranges {
+            let modifiers = match range.kind {
+                CommentKind::Doc => doc_bit.unwrap_or(0),
+                CommentKind::Plain => 0,
+            };
             for line in range.start_line..=range.end_line {
                 if lines_with_lake_token.contains(&line) {
                     continue;
@@ -113,7 +124,7 @@ async fn handle_request(
                         start,
                         length: end - start,
                         ty: comment_idx,
-                        modifiers: doc_bit,
+                        modifiers,
                     });
                 }
             }
@@ -337,14 +348,21 @@ fn make_token(line_str: &str, line: usize, start: usize, end: usize, ty: u32) ->
     }
 }
 
-struct DocRange {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommentKind {
+    Doc,
+    Plain,
+}
+
+struct CommentRange {
+    kind: CommentKind,
     start_line: u32,
     start_col: u32,
     end_line: u32,
     end_col: u32,
 }
 
-impl DocRange {
+impl CommentRange {
     fn covers(&self, line: u32, col: u32) -> bool {
         if line < self.start_line || line > self.end_line {
             return false;
@@ -359,37 +377,80 @@ impl DocRange {
     }
 }
 
-fn scan_doc_comment_ranges(text: &str) -> Vec<DocRange> {
+fn scan_comment_ranges(text: &str) -> Vec<CommentRange> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    while i + 2 < bytes.len() {
-        let opens_doc = bytes[i] == b'/'
-            && bytes[i + 1] == b'-'
-            && (bytes[i + 2] == b'-' || bytes[i + 2] == b'!');
-        if !opens_doc {
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
             i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => i += 2,
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
             continue;
         }
-        let start_byte = i;
-        let mut j = i + 3;
-        let mut end_byte = bytes.len();
-        while j + 1 < bytes.len() {
-            if bytes[j] == b'-' && bytes[j + 1] == b'/' {
-                end_byte = j + 2;
-                break;
+
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let start_byte = i;
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
             }
-            j += 1;
+            let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
+            let (el, ec) = byte_to_line_col_utf16(text, j);
+            out.push(CommentRange {
+                kind: CommentKind::Plain,
+                start_line: sl,
+                start_col: sc,
+                end_line: el,
+                end_col: ec,
+            });
+            i = j;
+            continue;
         }
-        let (start_line, start_col) = byte_to_line_col_utf16(text, start_byte);
-        let (end_line, end_col) = byte_to_line_col_utf16(text, end_byte);
-        out.push(DocRange {
-            start_line,
-            start_col,
-            end_line,
-            end_col,
-        });
-        i = end_byte;
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let kind = if i + 2 < bytes.len() && (bytes[i + 2] == b'-' || bytes[i + 2] == b'!') {
+                CommentKind::Doc
+            } else {
+                CommentKind::Plain
+            };
+            let start_byte = i;
+            let mut j = i + 2;
+            let mut depth: u32 = 1;
+            while j + 1 < bytes.len() && depth > 0 {
+                if bytes[j] == b'/' && bytes[j + 1] == b'-' {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j] == b'-' && bytes[j + 1] == b'/' {
+                    depth -= 1;
+                    j += 2;
+                } else {
+                    j += 1;
+                }
+            }
+            let end_byte = j;
+            let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
+            let (el, ec) = byte_to_line_col_utf16(text, end_byte);
+            out.push(CommentRange {
+                kind,
+                start_line: sl,
+                start_col: sc,
+                end_line: el,
+                end_col: ec,
+            });
+            i = end_byte;
+            continue;
+        }
+
+        i += 1;
     }
     out
 }
