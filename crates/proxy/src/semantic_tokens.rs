@@ -75,17 +75,25 @@ async fn handle_request(
     };
 
     let mut tokens = decode_tokens(&lake);
-    if let Some(comment_idx) = state.token_type_index("comment").await {
+    let comment_idx = state.token_type_index("comment").await;
+    let string_idx = state.token_type_index("string").await;
+    let lex = if comment_idx.is_some() || string_idx.is_some() {
+        scan_lex_ranges(&text)
+    } else {
+        LexRanges::default()
+    };
+
+    if let Some(comment_idx) = comment_idx {
         let doc_bit = state
             .token_modifier_index("documentation")
             .await
             .map(|i| 1u32 << i);
-        let ranges = scan_comment_ranges(&text);
         let lines_with_lake_token: HashSet<u32> = tokens.iter().map(|t| t.line).collect();
 
         if let Some(doc_bit) = doc_bit {
             for token in &mut tokens {
-                if ranges
+                if lex
+                    .comments
                     .iter()
                     .any(|r| r.kind == CommentKind::Doc && r.covers(token.line, token.start))
                 {
@@ -93,40 +101,39 @@ async fn handle_request(
                 }
             }
         }
-        for range in &ranges {
+        for range in &lex.comments {
             let modifiers = match range.kind {
                 CommentKind::Doc => doc_bit.unwrap_or(0),
                 CommentKind::Plain => 0,
             };
-            for line in range.start_line..=range.end_line {
-                if lines_with_lake_token.contains(&line) {
-                    continue;
-                }
-                let line_text = text
-                    .split('\n')
-                    .nth(line as usize)
-                    .map_or("", |l| l.trim_end_matches('\r'));
-                let line_len = line_text.encode_utf16().count() as u32;
-                let start = if line == range.start_line {
-                    range.start_col
-                } else {
-                    0
-                };
-                let end = if line == range.end_line {
-                    range.end_col
-                } else {
-                    line_len
-                };
-                if end > start {
-                    tokens.push(Token {
-                        line,
-                        start,
-                        length: end - start,
-                        ty: comment_idx,
-                        modifiers,
-                    });
-                }
-            }
+            emit_range_tokens(
+                &text,
+                &lines_with_lake_token,
+                range.start_line,
+                range.start_col,
+                range.end_line,
+                range.end_col,
+                comment_idx,
+                modifiers,
+                &mut tokens,
+            );
+        }
+    }
+
+    if let Some(string_idx) = string_idx {
+        let lines_with_lake_token: HashSet<u32> = tokens.iter().map(|t| t.line).collect();
+        for range in &lex.strings {
+            emit_range_tokens(
+                &text,
+                &lines_with_lake_token,
+                range.start_line,
+                range.start_col,
+                range.end_line,
+                range.end_col,
+                string_idx,
+                0,
+                &mut tokens,
+            );
         }
     }
 
@@ -393,28 +400,72 @@ impl CommentRange {
     }
 }
 
-fn scan_comment_ranges(text: &str) -> Vec<CommentRange> {
+struct StringRange {
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+}
+
+#[derive(Default)]
+struct LexRanges {
+    comments: Vec<CommentRange>,
+    strings: Vec<StringRange>,
+}
+
+fn scan_lex_ranges(text: &str) -> LexRanges {
     let bytes = text.as_bytes();
-    let mut out = Vec::new();
+    let mut out = LexRanges::default();
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b == b'"' {
-            i += 1;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' if i + 1 < bytes.len() => i += 2,
-                    b'"' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => i += 1,
-                }
-            }
+
+        if (b == b's' || b == b'm')
+            && bytes.get(i + 1) == Some(&b'!')
+            && bytes.get(i + 2) == Some(&b'"')
+            && !prev_byte_is_ident_continue(bytes, i)
+        {
+            let start = i;
+            let body_end = consume_quoted(bytes, i + 3);
+            push_string(text, &mut out.strings, start, body_end);
+            i = body_end;
             continue;
         }
 
-        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+        if b == b'r' && !prev_byte_is_ident_continue(bytes, i) {
+            let mut hashes = 0usize;
+            let mut k = i + 1;
+            while bytes.get(k) == Some(&b'#') {
+                hashes += 1;
+                k += 1;
+            }
+            if bytes.get(k) == Some(&b'"') {
+                let start = i;
+                let body_end = consume_raw(bytes, k + 1, hashes);
+                push_string(text, &mut out.strings, start, body_end);
+                i = body_end;
+                continue;
+            }
+        }
+
+        if b == b'"' {
+            let start = i;
+            let body_end = consume_quoted(bytes, i + 1);
+            push_string(text, &mut out.strings, start, body_end);
+            i = body_end;
+            continue;
+        }
+
+        if b == b'\'' && !prev_byte_is_ident_continue(bytes, i) {
+            let start = i;
+            if let Some(end) = consume_char_lit(bytes, i + 1) {
+                push_string(text, &mut out.strings, start, end);
+                i = end;
+                continue;
+            }
+        }
+
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
             let start_byte = i;
             let mut j = i + 2;
             while j < bytes.len() && bytes[j] != b'\n' {
@@ -422,7 +473,7 @@ fn scan_comment_ranges(text: &str) -> Vec<CommentRange> {
             }
             let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
             let (el, ec) = byte_to_line_col_utf16(text, j);
-            out.push(CommentRange {
+            out.comments.push(CommentRange {
                 kind: CommentKind::Plain,
                 start_line: sl,
                 start_col: sc,
@@ -432,8 +483,9 @@ fn scan_comment_ranges(text: &str) -> Vec<CommentRange> {
             i = j;
             continue;
         }
-        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            let kind = if i + 2 < bytes.len() && (bytes[i + 2] == b'-' || bytes[i + 2] == b'!') {
+
+        if b == b'/' && bytes.get(i + 1) == Some(&b'-') {
+            let kind = if matches!(bytes.get(i + 2), Some(&b'-' | &b'!')) {
                 CommentKind::Doc
             } else {
                 CommentKind::Plain
@@ -455,7 +507,7 @@ fn scan_comment_ranges(text: &str) -> Vec<CommentRange> {
             let end_byte = j;
             let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
             let (el, ec) = byte_to_line_col_utf16(text, end_byte);
-            out.push(CommentRange {
+            out.comments.push(CommentRange {
                 kind,
                 start_line: sl,
                 start_col: sc,
@@ -469,6 +521,105 @@ fn scan_comment_ranges(text: &str) -> Vec<CommentRange> {
         i += 1;
     }
     out
+}
+
+fn prev_byte_is_ident_continue(bytes: &[u8], i: usize) -> bool {
+    if i == 0 {
+        return false;
+    }
+    let prev = bytes[i - 1];
+    prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'\''
+}
+
+fn consume_quoted(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn consume_raw(bytes: &[u8], mut i: usize, hashes: usize) -> usize {
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let mut k = i + 1;
+            let mut count = 0;
+            while count < hashes && bytes.get(k) == Some(&b'#') {
+                count += 1;
+                k += 1;
+            }
+            if count == hashes {
+                return k;
+            }
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+fn consume_char_lit(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let limit = (i + 16).min(bytes.len());
+    while i < limit {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'\'' => return Some(i + 1),
+            b'\n' => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn push_string(text: &str, out: &mut Vec<StringRange>, start_byte: usize, end_byte: usize) {
+    if end_byte <= start_byte {
+        return;
+    }
+    let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
+    let (el, ec) = byte_to_line_col_utf16(text, end_byte);
+    out.push(StringRange {
+        start_line: sl,
+        start_col: sc,
+        end_line: el,
+        end_col: ec,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_range_tokens(
+    text: &str,
+    lines_with_lake_token: &HashSet<u32>,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    ty: u32,
+    modifiers: u32,
+    out: &mut Vec<Token>,
+) {
+    for line in start_line..=end_line {
+        if lines_with_lake_token.contains(&line) {
+            continue;
+        }
+        let line_text = text
+            .split('\n')
+            .nth(line as usize)
+            .map_or("", |l| l.trim_end_matches('\r'));
+        let line_len = line_text.encode_utf16().count() as u32;
+        let start = if line == start_line { start_col } else { 0 };
+        let end = if line == end_line { end_col } else { line_len };
+        if end > start {
+            out.push(Token {
+                line,
+                start,
+                length: end - start,
+                ty,
+                modifiers,
+            });
+        }
+    }
 }
 
 fn byte_to_line_col_utf16(text: &str, byte_offset: usize) -> (u32, u32) {
