@@ -314,9 +314,7 @@ impl Inlay {
 
         if !was_processing {
             let mut cache = self.cache.lock().await;
-            let needs_reset = cache
-                .peek(uri)
-                .is_none_or(|f| f.version != current_version);
+            let needs_reset = cache.peek(uri).is_none_or(|f| f.version != current_version);
             if needs_reset {
                 cache.put(uri.to_string(), FileCache::new(current_version));
             }
