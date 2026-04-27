@@ -1,10 +1,14 @@
 # 🪜 lean-to
 
-Zed extension that adds Lean 4 support with a more native feel through heterodox means.
+Zed extension that adds Lean 4 support with a more native feel through LSP shenanigans.
+
+Since the official Lean 4 language server was built with VSCode and its flexible extension API in mind, it doesn't fit well with Zed's more minimalistic approach.
+
+So `lean-to` makes Zed appear more capable to the official Lean 4 language server than it really is. In turn, the server sends more advanced requests, which `lean-to` intercepts and then converts into simpler messages that Zed can actually support.
 
 ## How it works
 
-`lean-to` runs `lake serve` behind a proxy that augments the LSP with features Zed otherwise wouldn't get from a vanilla Lean language server.
+`lean-to` has its own language server that is a proxy between Zed and the official Lean 4 language server. Standing in the middle allows us to intercept certain requests/responses framing them more idiomatically.
 
 ## Features
 
@@ -17,18 +21,20 @@ Each feature is on by default and individually toggleable:
 5. Elaboration progress bar `leanTo.progress`
 6. Auto-restart on outdated imports `leanTo.autoRestart`
 
-All feature flags live under `initialization_options.leanTo` for the `lean4-lsp` server in your Zed `settings.json`:
+You can toggle these features in your Zed settings:
 
 ```json
 {
   "lsp": {
     "lean_to_proxy": {
-      "inlayHints": true,
-      "codeLens": true,
-      "semanticTokens": true,
-      "hover": true,
-      "progress": true,
-      "autoRestart": true
+      "initialization_options": {
+        "inlayHints": true,
+        "codeLens": true,
+        "semanticTokens": true,
+        "hover": true,
+        "progress": true,
+        "autoRestart": true
+      }
     }
   }
 }

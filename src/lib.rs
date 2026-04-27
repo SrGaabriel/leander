@@ -15,7 +15,6 @@ impl LeanToExtension {
         let shell_env = worktree.shell_env();
         let lsp_settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
 
-        // Check lsp.lean4-lsp.binary
         if let Some(binary) = lsp_settings.binary
             && let Some(path) = binary.path
         {
@@ -148,7 +147,19 @@ impl LeanToExtension {
     fn find_or_download_proxy(
         &mut self,
         language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
     ) -> Result<String> {
+        let lsp_settings = LspSettings::for_worktree(language_server_id.as_ref(), worktree)?;
+        if let Some(path) = lsp_settings
+            .settings
+            .as_ref()
+            .and_then(|s| s.pointer("/proxy_path"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(path.to_string());
+        }
+
         let (platform, arch) = zed::current_platform();
         let arch_str = match arch {
             zed::Architecture::Aarch64 => "aarch64",
@@ -276,7 +287,7 @@ impl zed::Extension for LeanToExtension {
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
         let lean4_lsp_path = self.find_lean4_lsp(language_server_id, worktree)?;
-        let proxy_path = self.find_or_download_proxy(language_server_id)?;
+        let proxy_path = self.find_or_download_proxy(language_server_id, worktree)?;
         Ok(zed::Command {
             command: proxy_path,
             args: vec!["--lsp".to_string(), lean4_lsp_path],

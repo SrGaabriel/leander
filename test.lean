@@ -3,9 +3,8 @@ def createFile (path : System.FilePath) (content : String) : IO Unit := do
   handle.putStr content
   handle.flush
 
-def test_string : String := s!"Hello, World!"
+def test_string : String := "Hello, World!"
 
-/-- A test of a theorem -/
 theorem add_zero (n : Nat) : n + 0 = n := by
   induction n with
   | zero => rfl
@@ -13,8 +12,7 @@ theorem add_zero (n : Nat) : n + 0 = n := by
       have h₁ : Nat.succ n + 0 = Nat.succ (n + 0) := by
         rfl
       have h₂ : Nat.succ (n + 0) = Nat.succ n := by
-        apply congrArg Nat.succ
-        rfl
+        apply congrArg Nat.succ ih
       have h₃ : Nat.succ n + 0 = Nat.succ n := by
         exact Eq.trans h₁ h₂
       exact h₃

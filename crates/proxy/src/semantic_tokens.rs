@@ -84,12 +84,14 @@ async fn handle_request(
         LexRanges::default()
     };
 
+    let lake_token_positions: HashSet<(u32, u32)> =
+        tokens.iter().map(|t| (t.line, t.start)).collect();
+
     if let Some(comment_idx) = comment_idx {
         let doc_bit = state
             .token_modifier_index("documentation")
             .await
             .map(|i| 1u32 << i);
-        let lines_with_lake_token: HashSet<u32> = tokens.iter().map(|t| t.line).collect();
 
         if let Some(doc_bit) = doc_bit {
             for token in &mut tokens {
@@ -109,7 +111,7 @@ async fn handle_request(
             };
             emit_range_tokens(
                 &text,
-                &lines_with_lake_token,
+                &lake_token_positions,
                 range.start_line,
                 range.start_col,
                 range.end_line,
@@ -122,11 +124,10 @@ async fn handle_request(
     }
 
     if let Some(string_idx) = string_idx {
-        let lines_with_lake_token: HashSet<u32> = tokens.iter().map(|t| t.line).collect();
         for range in &lex.strings {
             emit_range_tokens(
                 &text,
-                &lines_with_lake_token,
+                &lake_token_positions,
                 range.start_line,
                 range.start_col,
                 range.end_line,
@@ -610,7 +611,7 @@ fn push_string(text: &str, out: &mut Vec<StringRange>, start_byte: usize, end_by
 #[allow(clippy::too_many_arguments)]
 fn emit_range_tokens(
     text: &str,
-    lines_with_lake_token: &HashSet<u32>,
+    lake_positions: &HashSet<(u32, u32)>,
     start_line: u32,
     start_col: u32,
     end_line: u32,
@@ -620,9 +621,6 @@ fn emit_range_tokens(
     out: &mut Vec<Token>,
 ) {
     for line in start_line..=end_line {
-        if lines_with_lake_token.contains(&line) {
-            continue;
-        }
         let line_text = text
             .split('\n')
             .nth(line as usize)
@@ -630,7 +628,7 @@ fn emit_range_tokens(
         let line_len = line_text.encode_utf16().count() as u32;
         let start = if line == start_line { start_col } else { 0 };
         let end = if line == end_line { end_col } else { line_len };
-        if end > start {
+        if end > start && !lake_positions.contains(&(line, start)) {
             out.push(Token {
                 line,
                 start,
