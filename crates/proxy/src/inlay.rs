@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use lru::LruCache;
 use serde_json::{Value, json};
@@ -15,7 +15,8 @@ const REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const INLINE_TARGET_LIMIT: usize = 70;
 const ELABORATION_WAIT_BUDGET: Duration = Duration::from_secs(3);
 const MAX_CONCURRENT_PROBES: usize = 8;
-const MAX_CACHE_ENTRIES_PER_FILE: usize = 2048;
+const MAX_CACHED_FILES: usize = 32;
+const MAX_CACHE_ENTRIES_PER_FILE: usize = 512;
 
 pub fn spawn(
     lsp: LspHandle,
@@ -27,7 +28,9 @@ pub fn spawn(
         lsp,
         state: state.clone(),
         documents,
-        cache: Mutex::new(HashMap::new()),
+        cache: Mutex::new(LruCache::new(
+            NonZeroUsize::new(MAX_CACHED_FILES).expect("non-zero cap"),
+        )),
         probe_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES)),
     });
     spawn_request_worker(inlay.clone(), requests);
@@ -36,7 +39,7 @@ pub fn spawn(
 
 type ProbeKey = (u64, u64);
 type ProbeLru = LruCache<ProbeKey, Option<Value>>;
-type InlayCache = HashMap<String, FileCache>;
+type InlayCache = LruCache<String, FileCache>;
 
 struct FileCache {
     version: i64,
@@ -255,7 +258,7 @@ async fn hints_for_line(
 
 impl Inlay {
     async fn invalidate(&self, uri: &str) {
-        self.cache.lock().await.remove(uri);
+        self.cache.lock().await.pop(uri);
     }
 
     fn sorry_hint(&self, uri: &str, line: u64) -> Option<Value> {
@@ -311,13 +314,15 @@ impl Inlay {
 
         if !was_processing {
             let mut cache = self.cache.lock().await;
-            let entry = cache
-                .entry(uri.to_string())
-                .or_insert_with(|| FileCache::new(current_version));
-            if entry.version != current_version {
-                *entry = FileCache::new(current_version);
+            let needs_reset = cache
+                .peek(uri)
+                .is_none_or(|f| f.version != current_version);
+            if needs_reset {
+                cache.put(uri.to_string(), FileCache::new(current_version));
             }
-            entry.entries.put((line, character), value.clone());
+            if let Some(entry) = cache.get_mut(uri) {
+                entry.entries.put((line, character), value.clone());
+            }
         }
         value
     }

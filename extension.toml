@@ -1,7 +1,7 @@
 id = "leander"
 name = "Leander"
 description = "Enhanced and idiomatic Zed support for Lean 4"
-version = "0.4.0"
+version = "0.4.1"
 schema_version = 1
 authors = ["Gabriel <gabriel@minatel.dev>"]
 repository = "https://github.com/SrGaabriel/leander"

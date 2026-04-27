@@ -14,3 +14,4 @@ ropey.workspace = true
 arc-swap.workspace = true
 dashmap.workspace = true
 lru.workspace = true
+mimalloc.workspace = true

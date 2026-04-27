@@ -32,6 +32,35 @@ pub struct ResponseError {
 
 type Pending = HashMap<String, oneshot::Sender<Result<Value, ResponseError>>>;
 
+struct PendingGuard {
+    id: Option<String>,
+    pending: Arc<Mutex<Pending>>,
+}
+
+impl PendingGuard {
+    fn new(id: String, pending: Arc<Mutex<Pending>>) -> Self {
+        Self {
+            id: Some(id),
+            pending,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.pending
+                .lock()
+                .expect("pending mutex poisoned")
+                .remove(&id);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct InlayRequest {
     pub id: Value,
@@ -104,6 +133,8 @@ impl LspHandle {
             .expect("pending mutex poisoned")
             .insert(id.to_string(), tx);
 
+        let guard = PendingGuard::new(id.to_string(), self.inner.pending.clone());
+
         let body = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -113,22 +144,20 @@ impl LspHandle {
         let frame = encode_frame(&serde_json::to_vec(&body).expect("serialize request"));
 
         if target.send(frame).await.is_err() {
-            self.inner
-                .pending
-                .lock()
-                .expect("pending mutex poisoned")
-                .remove(id);
+            drop(guard);
             return Err(ResponseError {
                 code: -1,
                 message: format!("{target_name} pipe closed"),
             });
         }
-        rx.await.unwrap_or_else(|_| {
+        let result = rx.await.unwrap_or_else(|_| {
             Err(ResponseError {
                 code: -1,
                 message: "router dropped".into(),
             })
-        })
+        });
+        guard.disarm();
+        result
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> std::io::Result<()> {
@@ -577,6 +606,9 @@ async fn merge_hover(
         let goal_fut = handle.request_with_id(&goal_id, "$/lean/plainGoal", goal_params);
         let goal_with_timeout = tokio::time::timeout(Duration::from_millis(150), goal_fut);
         let (h, g) = tokio::join!(hover_fut, goal_with_timeout);
+        if g.is_err() {
+            handle.cancel(&goal_id).await;
+        }
         let goal = match g {
             Ok(Ok(v)) => v,
             _ => Value::Null,

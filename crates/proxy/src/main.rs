@@ -1,5 +1,8 @@
 #![warn(clippy::pedantic)]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod code_lens;
 mod documents;
 mod framing;
