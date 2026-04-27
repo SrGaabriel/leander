@@ -41,12 +41,12 @@ jobs:
             ext: ".exe"
             cross: false
           - target: aarch64-pc-windows-msvc
-            runner: windows-latest
+            runner: windows-11-arm
             ext: ".exe"
             cross: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -78,7 +78,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/proxy${{ matrix.ext }}" \
              "dist/leander-proxy-${{ matrix.target }}${{ matrix.ext }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: leander-proxy-${{ matrix.target }}
           path: dist/leander-proxy-${{ matrix.target }}${{ matrix.ext }}
@@ -90,9 +90,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: dist
           merge-multiple: true
