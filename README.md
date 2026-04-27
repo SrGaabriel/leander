@@ -1,4 +1,13 @@
+<div align="center">
+
 # 🚣 leander
+
+[![ci](https://img.shields.io/github/actions/workflow/status/SrGaabriel/lean-to/ci.yml?branch=main&label=ci&style=flat-square)](https://github.com/SrGaabriel/lean-to/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/SrGaabriel/lean-to?style=flat-square&label=release&color=blue)](https://github.com/SrGaabriel/lean-to/releases/latest)
+
+<sub>*In Greek myth, Leander swam the strait every night to reach the lamplit tower.*</sub>
+
+</div>
 
 Zed extension that adds Lean 4 support with a more native feel through LSP shenanigans.
 
