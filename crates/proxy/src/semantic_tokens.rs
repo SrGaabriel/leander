@@ -49,6 +49,7 @@ async fn run(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_request(
     lsp: LspHandle,
     state: StateHandle,
@@ -155,7 +156,11 @@ async fn handle_request(
     let mut additions: Vec<Token> = Vec::new();
     scan_lines_unified(&text, &kinds, &mut additions);
 
-    additions.retain(|t| !existing.contains(&(t.line, t.start)));
+    additions.retain(|t| {
+        !existing.contains(&(t.line, t.start))
+            && !lex.strings.iter().any(|r| r.covers(t.line, t.start))
+            && !lex.comments.iter().any(|r| r.covers(t.line, t.start))
+    });
     tokens.extend(additions);
 
     tokens.sort_by_key(|t| (t.line, t.start));
@@ -405,6 +410,21 @@ struct StringRange {
     start_col: u32,
     end_line: u32,
     end_col: u32,
+}
+
+impl StringRange {
+    fn covers(&self, line: u32, col: u32) -> bool {
+        if line < self.start_line || line > self.end_line {
+            return false;
+        }
+        if line == self.start_line && col < self.start_col {
+            return false;
+        }
+        if line == self.end_line && col >= self.end_col {
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Default)]
