@@ -2,8 +2,6 @@ use std::{fs, path::PathBuf};
 
 use zed_extension_api::{self as zed, Result, serde_json::Value, settings::LspSettings};
 
-const PROXY_REPO: &str = "SrGaabriel/lean-to";
-
 struct LeanToExtension;
 
 impl LeanToExtension {
@@ -178,14 +176,14 @@ impl LeanToExtension {
         } else {
             ""
         };
-        let asset_name = format!("lean-to-proxy-{arch_str}-{platform_str}{ext}");
-        let binary_name = format!("lean-to-proxy{ext}");
+        let asset_name = format!("leander-proxy-{arch_str}-{platform_str}{ext}");
+        let binary_name = format!("leander-proxy{ext}");
 
         let cwd =
             std::env::current_dir().map_err(|e| format!("Failed to get current directory: {e}"))?;
 
         let release_result = zed::latest_github_release(
-            PROXY_REPO,
+            "SrGaabriel/leander",
             zed::GithubReleaseOptions {
                 require_assets: true,
                 pre_release: false,
@@ -199,7 +197,7 @@ impl LeanToExtension {
                     return Ok(cached);
                 }
                 return Err(format!(
-                    "Failed to fetch latest lean-to release ({release_err})"
+                    "Failed to fetch latest leander release ({release_err})"
                 ));
             }
         };
@@ -218,7 +216,7 @@ impl LeanToExtension {
             .find(|a| a.name == asset_name)
             .ok_or_else(|| {
                 format!(
-                    "lean-to release {} has no asset named {asset_name}",
+                    "leander release {} has no asset named {asset_name}",
                     release.version
                 )
             })?;

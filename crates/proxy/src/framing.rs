@@ -1,3 +1,5 @@
+use std::io::Write as _;
+
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt};
 
 pub async fn read_message<R>(r: &mut R) -> io::Result<Option<(Vec<u8>, Vec<u8>)>>
@@ -50,20 +52,5 @@ pub fn encode_frame(body: &[u8]) -> Vec<u8> {
 }
 
 pub fn write_header(out: &mut Vec<u8>, content_length: usize) {
-    out.extend_from_slice(b"Content-Length: ");
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    let mut n = content_length;
-    if n == 0 {
-        i -= 1;
-        buf[i] = b'0';
-    } else {
-        while n > 0 {
-            i -= 1;
-            buf[i] = b'0' + u8::try_from(n % 10).expect("digit fits in u8");
-            n /= 10;
-        }
-    }
-    out.extend_from_slice(&buf[i..]);
-    out.extend_from_slice(b"\r\n\r\n");
+    write!(out, "Content-Length: {content_length}\r\n\r\n").expect("write to Vec is infallible");
 }

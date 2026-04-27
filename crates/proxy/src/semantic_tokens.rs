@@ -1,14 +1,19 @@
 #![allow(clippy::cast_possible_truncation)]
 
-use std::collections::HashSet;
-
-use serde_json::{Value, json};
-use tokio::sync::mpsc;
-
-use crate::{
-    code_lens::DECL_KEYWORDS, documents::Documents, lsp::{LspHandle, SemanticTokensRequest}, state::StateHandle
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc};
+
+use crate::{
+    code_lens::DECL_KEYWORDS,
+    documents::Documents,
+    lsp::{LspHandle, SemanticTokensRequest},
+    state::{StateEvent, StateHandle},
+};
 
 #[derive(Clone, Copy, Debug)]
 struct Token {
@@ -19,13 +24,35 @@ struct Token {
     modifiers: u32,
 }
 
+#[derive(Default)]
+struct ScanCache {
+    entries: HashMap<String, CachedScan>,
+}
+
+struct CachedScan {
+    version: i64,
+    lex: Arc<LexRanges>,
+    additions: Arc<Vec<Token>>,
+}
+
 pub fn spawn(
     lsp: LspHandle,
     state: StateHandle,
     documents: Documents,
     requests: mpsc::Receiver<SemanticTokensRequest>,
 ) {
-    tokio::spawn(run(lsp, state, documents, requests));
+    let cache = Arc::new(Mutex::new(ScanCache::default()));
+    tokio::spawn(invalidate_on_close(cache.clone(), state.clone()));
+    tokio::spawn(run(lsp, state, documents, requests, cache));
+}
+
+async fn invalidate_on_close(cache: Arc<Mutex<ScanCache>>, state: StateHandle) {
+    let mut events = state.subscribe();
+    while let Ok(ev) = events.recv().await {
+        if let StateEvent::DidClose { uri } = ev {
+            cache.lock().await.entries.remove(&uri);
+        }
+    }
 }
 
 async fn run(
@@ -33,13 +60,15 @@ async fn run(
     state: StateHandle,
     documents: Documents,
     mut requests: mpsc::Receiver<SemanticTokensRequest>,
+    cache: Arc<Mutex<ScanCache>>,
 ) {
     while let Some(req) = requests.recv().await {
         let lsp = lsp.clone();
         let state = state.clone();
         let documents = documents.clone();
+        let cache = cache.clone();
         tokio::spawn(async move {
-            handle_request(lsp, state, documents, req).await;
+            handle_request(lsp, state, documents, req, cache).await;
         });
     }
 }
@@ -50,6 +79,7 @@ async fn handle_request(
     state: StateHandle,
     documents: Documents,
     req: SemanticTokensRequest,
+    cache: Arc<Mutex<ScanCache>>,
 ) {
     let id = lsp.alloc_id();
     let lake = lsp
@@ -60,41 +90,86 @@ async fn handle_request(
     let uri = req
         .params
         .pointer("/textDocument/uri")
-        .and_then(Value::as_str);
-    let text = match uri {
-        Some(u) => documents.full_text(u).await,
-        None => None,
-    };
-    let Some(text) = text else {
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(uri) = uri else {
         let _ = lsp.respond_to_client(req.id, lake).await;
         return;
     };
 
-    let mut tokens = decode_tokens(&lake);
-    let comment_idx = state.token_type_index("comment").await;
-    let string_idx = state.token_type_index("string").await;
-    let lex = if comment_idx.is_some() || string_idx.is_some() {
-        scan_lex_ranges(&text)
-    } else {
-        LexRanges::default()
+    let comment_idx = state.token_type_index("comment");
+    let string_idx = state.token_type_index("string");
+    let kinds = ScanKinds {
+        number: state.token_type_index("number"),
+        decl_name: state
+            .token_type_index("function")
+            .or(state.token_type_index("method")),
+        capitalized: state.token_type_index("type"),
+        member: state
+            .token_type_index("property")
+            .or(state.token_type_index("method")),
     };
 
+    let current_version = state.version_for(&uri).unwrap_or(0);
+
+    let cached = {
+        let cache_guard = cache.lock().await;
+        cache_guard.entries.get(&uri).and_then(|s| {
+            if s.version == current_version {
+                Some((s.lex.clone(), s.additions.clone()))
+            } else {
+                None
+            }
+        })
+    };
+
+    let Some(text) = documents.full_text(&uri) else {
+        let _ = lsp.respond_to_client(req.id, lake).await;
+        return;
+    };
+
+    let (lex, additions_all) = if let Some(c) = cached {
+        c
+    } else {
+        let lex = if comment_idx.is_some() || string_idx.is_some() {
+            Arc::new(scan_lex_ranges(&text))
+        } else {
+            Arc::new(LexRanges::default())
+        };
+        let mut additions: Vec<Token> = Vec::new();
+        scan_lines_unified(&text, &kinds, &mut additions);
+        let additions = Arc::new(additions);
+        cache.lock().await.entries.insert(
+            uri.clone(),
+            CachedScan {
+                version: current_version,
+                lex: lex.clone(),
+                additions: additions.clone(),
+            },
+        );
+        (lex, additions)
+    };
+
+    let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+
+    let mut tokens = decode_tokens(&lake);
     let lake_token_positions: HashSet<(u32, u32)> =
         tokens.iter().map(|t| (t.line, t.start)).collect();
 
     if let Some(comment_idx) = comment_idx {
         let doc_bit = state
             .token_modifier_index("documentation")
-            .await
             .map(|i| 1u32 << i);
 
         if let Some(doc_bit) = doc_bit {
-            for token in &mut tokens {
-                if lex
-                    .comments
+            let doc_index = RangeLineIndex::from_iter(
+                lex.comments
                     .iter()
-                    .any(|r| r.kind == CommentKind::Doc && r.covers(token.line, token.start))
-                {
+                    .filter(|r| r.kind == CommentKind::Doc)
+                    .map(CommentRange::span),
+            );
+            for token in &mut tokens {
+                if doc_index.covers(token.line, token.start) {
                     token.modifiers |= doc_bit;
                 }
             }
@@ -105,7 +180,7 @@ async fn handle_request(
                 CommentKind::Plain => 0,
             };
             emit_range_tokens(
-                &text,
+                &lines,
                 &lake_token_positions,
                 range.start_line,
                 range.start_col,
@@ -121,7 +196,7 @@ async fn handle_request(
     if let Some(string_idx) = string_idx {
         for range in &lex.strings {
             emit_range_tokens(
-                &text,
+                &lines,
                 &lake_token_positions,
                 range.start_line,
                 range.start_col,
@@ -135,29 +210,17 @@ async fn handle_request(
     }
 
     let existing: HashSet<(u32, u32)> = tokens.iter().map(|t| (t.line, t.start)).collect();
+    let strings_index = RangeLineIndex::from_iter(lex.strings.iter().map(StringRange::span));
+    let comments_index = RangeLineIndex::from_iter(lex.comments.iter().map(CommentRange::span));
 
-    let kinds = ScanKinds {
-        number: state.token_type_index("number").await,
-        decl_name: state
-            .token_type_index("function")
-            .await
-            .or(state.token_type_index("method").await),
-        capitalized: state.token_type_index("type").await,
-        member: state
-            .token_type_index("property")
-            .await
-            .or(state.token_type_index("method").await),
-    };
-
-    let mut additions: Vec<Token> = Vec::new();
-    scan_lines_unified(&text, &kinds, &mut additions);
-
-    additions.retain(|t| {
-        !existing.contains(&(t.line, t.start))
-            && !lex.strings.iter().any(|r| r.covers(t.line, t.start))
-            && !lex.comments.iter().any(|r| r.covers(t.line, t.start))
-    });
-    tokens.extend(additions);
+    for t in additions_all.iter() {
+        if !existing.contains(&(t.line, t.start))
+            && !strings_index.covers(t.line, t.start)
+            && !comments_index.covers(t.line, t.start)
+        {
+            tokens.push(*t);
+        }
+    }
 
     tokens.sort_by_key(|t| (t.line, t.start));
     let data = encode_tokens(&tokens);
@@ -378,6 +441,14 @@ enum CommentKind {
     Plain,
 }
 
+#[derive(Clone, Copy)]
+struct Span {
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+}
+
 struct CommentRange {
     kind: CommentKind,
     start_line: u32,
@@ -387,17 +458,13 @@ struct CommentRange {
 }
 
 impl CommentRange {
-    fn covers(&self, line: u32, col: u32) -> bool {
-        if line < self.start_line || line > self.end_line {
-            return false;
+    fn span(&self) -> Span {
+        Span {
+            start_line: self.start_line,
+            start_col: self.start_col,
+            end_line: self.end_line,
+            end_col: self.end_col,
         }
-        if line == self.start_line && col < self.start_col {
-            return false;
-        }
-        if line == self.end_line && col >= self.end_col {
-            return false;
-        }
-        true
     }
 }
 
@@ -409,17 +476,13 @@ struct StringRange {
 }
 
 impl StringRange {
-    fn covers(&self, line: u32, col: u32) -> bool {
-        if line < self.start_line || line > self.end_line {
-            return false;
+    fn span(&self) -> Span {
+        Span {
+            start_line: self.start_line,
+            start_col: self.start_col,
+            end_line: self.end_line,
+            end_col: self.end_col,
         }
-        if line == self.start_line && col < self.start_col {
-            return false;
-        }
-        if line == self.end_line && col >= self.end_col {
-            return false;
-        }
-        true
     }
 }
 
@@ -429,11 +492,91 @@ struct LexRanges {
     strings: Vec<StringRange>,
 }
 
+struct RangeLineIndex {
+    by_line: HashMap<u32, Vec<(u32, u32)>>,
+}
+
+impl RangeLineIndex {
+    fn from_iter<I: IntoIterator<Item = Span>>(iter: I) -> Self {
+        let mut by_line: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+        for span in iter {
+            for line in span.start_line..=span.end_line {
+                let start = if line == span.start_line {
+                    span.start_col
+                } else {
+                    0
+                };
+                let end = if line == span.end_line {
+                    span.end_col
+                } else {
+                    u32::MAX
+                };
+                if end > start {
+                    by_line.entry(line).or_default().push((start, end));
+                }
+            }
+        }
+        Self { by_line }
+    }
+
+    fn covers(&self, line: u32, col: u32) -> bool {
+        let Some(spans) = self.by_line.get(&line) else {
+            return false;
+        };
+        spans.iter().any(|(s, e)| col >= *s && col < *e)
+    }
+}
+
+struct LexScanner<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+    i: usize,
+    line: u32,
+    line_start_byte: usize,
+}
+
+impl<'a> LexScanner<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            bytes: text.as_bytes(),
+            i: 0,
+            line: 0,
+            line_start_byte: 0,
+        }
+    }
+
+    fn pos(&self, byte_offset: usize) -> (u32, u32) {
+        let clamped = byte_offset.min(self.bytes.len());
+        if clamped >= self.line_start_byte {
+            let col = self.text[self.line_start_byte..clamped]
+                .encode_utf16()
+                .count() as u32;
+            (self.line, col)
+        } else {
+            byte_to_line_col_utf16(self.text, clamped)
+        }
+    }
+
+    fn advance_to(&mut self, target: usize) {
+        let target = target.min(self.bytes.len());
+        while self.i < target {
+            if self.bytes[self.i] == b'\n' {
+                self.line += 1;
+                self.line_start_byte = self.i + 1;
+            }
+            self.i += 1;
+        }
+    }
+}
+
 fn scan_lex_ranges(text: &str) -> LexRanges {
     let bytes = text.as_bytes();
     let mut out = LexRanges::default();
-    let mut i = 0;
-    while i < bytes.len() {
+    let mut s = LexScanner::new(text);
+
+    while s.i < bytes.len() {
+        let i = s.i;
         let b = bytes[i];
 
         if (b == b's' || b == b'm')
@@ -441,10 +584,9 @@ fn scan_lex_ranges(text: &str) -> LexRanges {
             && bytes.get(i + 2) == Some(&b'"')
             && !prev_byte_is_ident_continue(bytes, i)
         {
-            let start = i;
             let body_end = consume_quoted(bytes, i + 3);
-            push_string(text, &mut out.strings, start, body_end);
-            i = body_end;
+            push_string(&mut s, &mut out.strings, i, body_end);
+            s.advance_to(body_end);
             continue;
         }
 
@@ -456,39 +598,37 @@ fn scan_lex_ranges(text: &str) -> LexRanges {
                 k += 1;
             }
             if bytes.get(k) == Some(&b'"') {
-                let start = i;
                 let body_end = consume_raw(bytes, k + 1, hashes);
-                push_string(text, &mut out.strings, start, body_end);
-                i = body_end;
+                push_string(&mut s, &mut out.strings, i, body_end);
+                s.advance_to(body_end);
                 continue;
             }
         }
 
         if b == b'"' {
-            let start = i;
             let body_end = consume_quoted(bytes, i + 1);
-            push_string(text, &mut out.strings, start, body_end);
-            i = body_end;
+            push_string(&mut s, &mut out.strings, i, body_end);
+            s.advance_to(body_end);
             continue;
         }
 
-        if b == b'\'' && !prev_byte_is_ident_continue(bytes, i) {
-            let start = i;
-            if let Some(end) = consume_char_lit(bytes, i + 1) {
-                push_string(text, &mut out.strings, start, end);
-                i = end;
-                continue;
-            }
+        if b == b'\''
+            && !prev_byte_is_ident_continue(bytes, i)
+            && let Some(end) = consume_char_lit(bytes, i + 1)
+        {
+            push_string(&mut s, &mut out.strings, i, end);
+            s.advance_to(end);
+            continue;
         }
 
         if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
-            let start_byte = i;
             let mut j = i + 2;
             while j < bytes.len() && bytes[j] != b'\n' {
                 j += 1;
             }
-            let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
-            let (el, ec) = byte_to_line_col_utf16(text, j);
+            let (sl, sc) = s.pos(i);
+            s.advance_to(j);
+            let (el, ec) = s.pos(j);
             out.comments.push(CommentRange {
                 kind: CommentKind::Plain,
                 start_line: sl,
@@ -496,7 +636,6 @@ fn scan_lex_ranges(text: &str) -> LexRanges {
                 end_line: el,
                 end_col: ec,
             });
-            i = j;
             continue;
         }
 
@@ -506,7 +645,6 @@ fn scan_lex_ranges(text: &str) -> LexRanges {
             } else {
                 CommentKind::Plain
             };
-            let start_byte = i;
             let mut j = i + 2;
             let mut depth: u32 = 1;
             while j + 1 < bytes.len() && depth > 0 {
@@ -520,9 +658,9 @@ fn scan_lex_ranges(text: &str) -> LexRanges {
                     j += 1;
                 }
             }
-            let end_byte = j;
-            let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
-            let (el, ec) = byte_to_line_col_utf16(text, end_byte);
+            let (sl, sc) = s.pos(i);
+            s.advance_to(j);
+            let (el, ec) = s.pos(j);
             out.comments.push(CommentRange {
                 kind,
                 start_line: sl,
@@ -530,11 +668,10 @@ fn scan_lex_ranges(text: &str) -> LexRanges {
                 end_line: el,
                 end_col: ec,
             });
-            i = end_byte;
             continue;
         }
 
-        i += 1;
+        s.advance_to(i + 1);
     }
     out
 }
@@ -589,12 +726,18 @@ fn consume_char_lit(bytes: &[u8], mut i: usize) -> Option<usize> {
     None
 }
 
-fn push_string(text: &str, out: &mut Vec<StringRange>, start_byte: usize, end_byte: usize) {
+fn push_string(
+    s: &mut LexScanner<'_>,
+    out: &mut Vec<StringRange>,
+    start_byte: usize,
+    end_byte: usize,
+) {
     if end_byte <= start_byte {
         return;
     }
-    let (sl, sc) = byte_to_line_col_utf16(text, start_byte);
-    let (el, ec) = byte_to_line_col_utf16(text, end_byte);
+    let (sl, sc) = s.pos(start_byte);
+    s.advance_to(end_byte);
+    let (el, ec) = s.pos(end_byte);
     out.push(StringRange {
         start_line: sl,
         start_col: sc,
@@ -605,7 +748,7 @@ fn push_string(text: &str, out: &mut Vec<StringRange>, start_byte: usize, end_by
 
 #[allow(clippy::too_many_arguments)]
 fn emit_range_tokens(
-    text: &str,
+    lines: &[&str],
     lake_positions: &HashSet<(u32, u32)>,
     start_line: u32,
     start_col: u32,
@@ -616,13 +759,11 @@ fn emit_range_tokens(
     out: &mut Vec<Token>,
 ) {
     for line in start_line..=end_line {
-        let line_text = text
-            .split('\n')
-            .nth(line as usize)
-            .map_or("", |l| l.trim_end_matches('\r'));
+        let line_text = lines.get(line as usize).copied().unwrap_or("");
         let line_len = line_text.encode_utf16().count() as u32;
         let start = if line == start_line { start_col } else { 0 };
-        let end = if line == end_line { end_col } else { line_len };
+        let end_raw = if line == end_line { end_col } else { line_len };
+        let end = end_raw.min(line_len);
         if end > start && !lake_positions.contains(&(line, start)) {
             out.push(Token {
                 line,

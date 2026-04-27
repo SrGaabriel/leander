@@ -15,6 +15,8 @@ const REFRESH_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub const DECL_KEYWORDS: &[&str] = &["theorem", "lemma", "example", "def", "instance", "abbrev"];
 
+const TITLE_SEP: &str = " \u{00B7} ";
+
 pub fn spawn(
     lsp: LspHandle,
     state: StateHandle,
@@ -25,17 +27,19 @@ pub fn spawn(
         lsp,
         state: state.clone(),
         documents,
-        last_response: Mutex::new(HashMap::new()),
+        decl_cache: Mutex::new(HashMap::new()),
     });
     spawn_request_worker(lens.clone(), requests);
     spawn_refresh_worker(lens, state);
 }
 
+type DeclCache = HashMap<String, (i64, Arc<Vec<Declaration>>)>;
+
 struct CodeLens {
     lsp: LspHandle,
     state: StateHandle,
     documents: Documents,
-    last_response: Mutex<HashMap<String, usize>>,
+    decl_cache: Mutex<DeclCache>,
 }
 
 fn spawn_request_worker(lens: Arc<CodeLens>, mut requests: mpsc::Receiver<CodeLensRequest>) {
@@ -57,7 +61,10 @@ fn spawn_refresh_worker(lens: Arc<CodeLens>, state: StateHandle) {
             tokio::select! {
                 ev = events.recv() => match ev {
                     Ok(StateEvent::ProgressChanged { .. } | StateEvent::DiagnosticsChanged { .. }) => pending = true,
-                    Ok(StateEvent::DidOpen {..} | StateEvent::DidClose { .. })
+                    Ok(StateEvent::DidClose { uri }) => {
+                        lens.decl_cache.lock().await.remove(&uri);
+                    }
+                    Ok(StateEvent::DidOpen { .. })
                     | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
@@ -87,10 +94,6 @@ impl CodeLens {
             return;
         };
         let lenses = self.compute(&uri).await;
-        self.last_response
-            .lock()
-            .await
-            .insert(uri.clone(), lenses.len());
         let _ = self
             .lsp
             .respond_to_client(req.id, Value::Array(lenses))
@@ -98,30 +101,25 @@ impl CodeLens {
     }
 
     async fn compute(&self, uri: &str) -> Vec<Value> {
-        let Some(text) = self.documents.full_text(uri).await else {
-            return Vec::new();
-        };
-        let diagnostics = self.state.diagnostics_for(uri).await;
+        let decls = self.declarations(uri).await;
+        let diagnostics = self.state.diagnostics_for(uri);
+        let diag_index = DiagnosticIndex::build(&diagnostics);
 
-        let mut lenses = Vec::new();
-        for decl in find_declarations(&text) {
-            let mut title_parts = Vec::<String>::new();
-            let status = decl_status(&diagnostics, decl.start_line, decl.end_line);
+        let mut lenses = Vec::with_capacity(decls.len());
+        for decl in decls.iter() {
+            let mut title_parts: Vec<String> = Vec::new();
+            let status = diag_index.status(decl.start_line, decl.end_line);
             title_parts.push(status.glyph().to_string());
-
             title_parts.push(format!("{} {}", decl.keyword, decl.name));
-            if decl.has_tactic_body {
-                let tactic_count = count_tactics(&text, decl.start_line, decl.end_line);
-                if tactic_count > 0 {
-                    title_parts.push(format!(
-                        "{} tactic{}",
-                        tactic_count,
-                        if tactic_count == 1 { "" } else { "s" }
-                    ));
-                }
+            if decl.tactic_count > 0 {
+                title_parts.push(format!(
+                    "{} tactic{}",
+                    decl.tactic_count,
+                    if decl.tactic_count == 1 { "" } else { "s" }
+                ));
             }
 
-            let title = title_parts.join(" · ");
+            let title = title_parts.join(TITLE_SEP);
             lenses.push(json!({
                 "range": {
                     "start": { "line": decl.start_line, "character": 0 },
@@ -136,6 +134,27 @@ impl CodeLens {
         }
         lenses
     }
+
+    async fn declarations(&self, uri: &str) -> Arc<Vec<Declaration>> {
+        let current_version = self.state.version_for(uri).unwrap_or(0);
+        {
+            let cache = self.decl_cache.lock().await;
+            if let Some((ver, decls)) = cache.get(uri)
+                && *ver == current_version
+            {
+                return decls.clone();
+            }
+        }
+        let Some(text) = self.documents.full_text(uri) else {
+            return Arc::new(Vec::new());
+        };
+        let decls = Arc::new(find_declarations(&text));
+        self.decl_cache
+            .lock()
+            .await
+            .insert(uri.to_string(), (current_version, decls.clone()));
+        decls
+    }
 }
 
 #[derive(Debug)]
@@ -144,7 +163,7 @@ struct Declaration {
     name: String,
     start_line: u64,
     end_line: u64,
-    has_tactic_body: bool,
+    tactic_count: usize,
 }
 
 fn find_declarations(text: &str) -> Vec<Declaration> {
@@ -176,12 +195,17 @@ fn find_declarations(text: &str) -> Vec<Declaration> {
                 .get(i)
                 .is_some_and(|l| l.contains(":= by") || l.trim() == "by")
         });
+        let tactic_count = if has_tactic_body {
+            count_tactics_in_lines(&lines, *line_idx, end_line)
+        } else {
+            0
+        };
         out.push(Declaration {
             keyword: keyword.clone(),
             name: name.clone(),
             start_line: *line_idx as u64,
             end_line: end_line as u64,
-            has_tactic_body,
+            tactic_count,
         });
     }
     out
@@ -208,35 +232,53 @@ enum Status {
 impl Status {
     fn glyph(self) -> &'static str {
         match self {
-            Status::Ok => "✓",
-            Status::Error => "✗",
-            Status::Warning => "⚠",
+            Status::Ok => "\u{2713}",
+            Status::Error => "\u{2717}",
+            Status::Warning => "\u{26A0}",
         }
     }
 }
 
-fn decl_status(diagnostics: &[Value], start: u64, end: u64) -> Status {
-    let mut worst = Status::Ok;
-    for d in diagnostics {
-        let l = d.pointer("/range/start/line").and_then(Value::as_u64);
-        let Some(l) = l else { continue };
-        if l < start || l > end {
-            continue;
-        }
-        let sev = d.get("severity").and_then(Value::as_i64).unwrap_or(0);
-        match sev {
-            v if v == SEVERITY_ERROR => return Status::Error,
-            v if v == SEVERITY_WARNING => worst = Status::Warning,
-            _ => {}
-        }
-    }
-    worst
+struct DiagnosticIndex {
+    by_line: Vec<(u64, i64)>,
 }
 
-fn count_tactics(text: &str, start_line: u64, end_line: u64) -> usize {
-    text.split('\n')
-        .skip(start_line as usize + 1)
-        .take((end_line - start_line) as usize)
+impl DiagnosticIndex {
+    fn build(diagnostics: &[Value]) -> Self {
+        let mut by_line: Vec<(u64, i64)> = diagnostics
+            .iter()
+            .filter_map(|d| {
+                let line = d.pointer("/range/start/line").and_then(Value::as_u64)?;
+                let sev = d.get("severity").and_then(Value::as_i64).unwrap_or(0);
+                Some((line, sev))
+            })
+            .collect();
+        by_line.sort_by_key(|(line, _)| *line);
+        Self { by_line }
+    }
+
+    fn status(&self, start: u64, end: u64) -> Status {
+        let lo = self.by_line.partition_point(|(line, _)| *line < start);
+        let mut worst = Status::Ok;
+        for (line, sev) in &self.by_line[lo..] {
+            if *line > end {
+                break;
+            }
+            match *sev {
+                v if v == SEVERITY_ERROR => return Status::Error,
+                v if v == SEVERITY_WARNING => worst = Status::Warning,
+                _ => {}
+            }
+        }
+        worst
+    }
+}
+
+fn count_tactics_in_lines(lines: &[&str], start_line: usize, end_line: usize) -> usize {
+    lines
+        .iter()
+        .skip(start_line + 1)
+        .take(end_line.saturating_sub(start_line))
         .filter(|l| {
             let t = l.trim();
             !t.is_empty() && !t.starts_with("--") && !t.starts_with("/-") && !t.starts_with('|')

@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use serde_json::Value;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 
 #[derive(Clone, Debug)]
 pub struct GoalSnapshot {
@@ -71,101 +73,104 @@ impl Config {
 
 #[derive(Clone)]
 pub struct StateHandle {
-    inner: Arc<Mutex<Inner>>,
-    events: broadcast::Sender<StateEvent>,
+    inner: Arc<Inner>,
 }
 
-#[derive(Default)]
 struct Inner {
-    goals: HashMap<String, GoalSnapshot>,
-    progress: HashMap<String, Value>,
-    versions: HashMap<String, i64>,
-    diagnostics: HashMap<String, Vec<Value>>,
-    semantic_token_types: Vec<String>,
-    semantic_token_modifiers: Vec<String>,
-    config: Config,
+    goals: DashMap<String, GoalSnapshot>,
+    progress: DashMap<String, Value>,
+    versions: DashMap<String, i64>,
+    diagnostics: DashMap<String, Vec<Value>>,
+    semantic_token_types: ArcSwap<Vec<String>>,
+    semantic_token_modifiers: ArcSwap<Vec<String>>,
+    config: ArcSwap<Config>,
+    events: broadcast::Sender<StateEvent>,
 }
 
 impl StateHandle {
     pub fn new() -> Self {
-        let (events, _) = broadcast::channel(64);
+        let (events, _) = broadcast::channel(1024);
         Self {
-            inner: Arc::new(Mutex::new(Inner::default())),
-            events,
+            inner: Arc::new(Inner {
+                goals: DashMap::new(),
+                progress: DashMap::new(),
+                versions: DashMap::new(),
+                diagnostics: DashMap::new(),
+                semantic_token_types: ArcSwap::from_pointee(Vec::new()),
+                semantic_token_modifiers: ArcSwap::from_pointee(Vec::new()),
+                config: ArcSwap::from_pointee(Config::default()),
+                events,
+            }),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StateEvent> {
-        self.events.subscribe()
+        self.inner.events.subscribe()
     }
 
-    pub async fn update_goals(&self, uri: &str, line: u64, character: u64, goals: Value) {
-        let snap = GoalSnapshot {
-            uri: uri.to_string(),
-            line,
-            character,
-            goals,
-        };
-        self.inner.lock().await.goals.insert(uri.to_string(), snap);
+    pub fn update_goals(&self, uri: &str, line: u64, character: u64, goals: Value) {
+        self.inner.goals.insert(
+            uri.to_string(),
+            GoalSnapshot {
+                uri: uri.to_string(),
+                line,
+                character,
+                goals,
+            },
+        );
     }
 
-    pub async fn update_progress(&self, uri: String, params: Value) {
-        self.inner.lock().await.progress.insert(uri.clone(), params);
-        let _ = self.events.send(StateEvent::ProgressChanged { uri });
+    pub fn update_progress(&self, uri: String, params: Value) {
+        self.inner.progress.insert(uri.clone(), params);
+        let _ = self.inner.events.send(StateEvent::ProgressChanged { uri });
     }
 
     pub fn note_did_open(&self, uri: String) {
-        let _ = self.events.send(StateEvent::DidOpen { uri });
+        let _ = self.inner.events.send(StateEvent::DidOpen { uri });
     }
 
-    pub async fn note_did_close(&self, uri: String) {
-        {
-            let mut inner = self.inner.lock().await;
-            inner.goals.remove(&uri);
-            inner.progress.remove(&uri);
-            inner.versions.remove(&uri);
-        }
-        let _ = self.events.send(StateEvent::DidClose { uri });
+    pub fn note_did_close(&self, uri: String) {
+        self.inner.goals.remove(&uri);
+        self.inner.progress.remove(&uri);
+        self.inner.versions.remove(&uri);
+        self.inner.diagnostics.remove(&uri);
+        let _ = self.inner.events.send(StateEvent::DidClose { uri });
     }
 
-    pub async fn update_version(&self, uri: String, version: i64) {
-        self.inner.lock().await.versions.insert(uri, version);
+    pub fn update_version(&self, uri: String, version: i64) {
+        self.inner.versions.insert(uri, version);
     }
 
-    pub async fn version_for(&self, uri: &str) -> Option<i64> {
-        self.inner.lock().await.versions.get(uri).copied()
+    pub fn version_for(&self, uri: &str) -> Option<i64> {
+        self.inner.versions.get(uri).map(|v| *v)
     }
 
-    pub async fn goals_for(&self, uri: &str) -> Option<GoalSnapshot> {
-        self.inner.lock().await.goals.get(uri).cloned()
+    pub fn goals_for(&self, uri: &str) -> Option<GoalSnapshot> {
+        self.inner.goals.get(uri).map(|v| v.clone())
     }
 
-    pub async fn progress_for(&self, uri: &str) -> Option<Value> {
-        self.inner.lock().await.progress.get(uri).cloned()
+    pub fn progress_for(&self, uri: &str) -> Option<Value> {
+        self.inner.progress.get(uri).map(|v| v.clone())
     }
 
-    pub async fn update_diagnostics(&self, uri: String, diagnostics: Vec<Value>) {
+    pub fn update_diagnostics(&self, uri: String, diagnostics: Vec<Value>) {
+        self.inner.diagnostics.insert(uri.clone(), diagnostics);
+        let _ = self
+            .inner
+            .events
+            .send(StateEvent::DiagnosticsChanged { uri });
+    }
+
+    pub fn diagnostics_for(&self, uri: &str) -> Vec<Value> {
         self.inner
-            .lock()
-            .await
-            .diagnostics
-            .insert(uri.clone(), diagnostics);
-        let _ = self.events.send(StateEvent::DiagnosticsChanged { uri });
-    }
-
-    pub async fn diagnostics_for(&self, uri: &str) -> Vec<Value> {
-        self.inner
-            .lock()
-            .await
             .diagnostics
             .get(uri)
-            .cloned()
+            .map(|v| v.clone())
             .unwrap_or_default()
     }
 
-    pub async fn diagnostics_at_line(&self, uri: &str, line: u64) -> Vec<Value> {
-        let inner = self.inner.lock().await;
-        let Some(diags) = inner.diagnostics.get(uri) else {
+    pub fn diagnostics_at_line(&self, uri: &str, line: u64) -> Vec<Value> {
+        let Some(diags) = self.inner.diagnostics.get(uri) else {
             return Vec::new();
         };
         diags
@@ -175,53 +180,53 @@ impl StateHandle {
             .collect()
     }
 
-    pub async fn is_processing(&self, uri: &str, line: u64) -> bool {
-        let inner = self.inner.lock().await;
-        let Some(progress) = inner.progress.get(uri) else {
+    pub fn is_processing(&self, uri: &str, line: u64) -> bool {
+        let Some(progress) = self.inner.progress.get(uri) else {
             return false;
         };
-        line_in_processing(progress, line)
+        line_in_processing(&progress, line)
     }
 
-    pub async fn set_semantic_token_types(&self, types: Vec<String>) {
-        self.inner.lock().await.semantic_token_types = types;
+    pub fn set_semantic_token_types(&self, types: Vec<String>) {
+        self.inner.semantic_token_types.store(Arc::new(types));
     }
 
-    pub async fn set_semantic_token_modifiers(&self, modifiers: Vec<String>) {
-        self.inner.lock().await.semantic_token_modifiers = modifiers;
+    pub fn set_semantic_token_modifiers(&self, modifiers: Vec<String>) {
+        self.inner
+            .semantic_token_modifiers
+            .store(Arc::new(modifiers));
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    pub async fn token_modifier_index(&self, name: &str) -> Option<u32> {
-        let inner = self.inner.lock().await;
-        inner
+    pub fn token_modifier_index(&self, name: &str) -> Option<u32> {
+        self.inner
             .semantic_token_modifiers
+            .load()
             .iter()
             .position(|m| m == name)
             .map(|i| i as u32)
     }
 
-    pub async fn set_config(&self, config: Config) {
-        self.inner.lock().await.config = config;
-    }
-
-    pub async fn config(&self) -> Config {
-        self.inner.lock().await.config.clone()
-    }
-
     #[allow(clippy::cast_possible_truncation)]
-    pub async fn token_type_index(&self, name: &str) -> Option<u32> {
-        let inner = self.inner.lock().await;
-        inner
+    pub fn token_type_index(&self, name: &str) -> Option<u32> {
+        self.inner
             .semantic_token_types
+            .load()
             .iter()
             .position(|t| t == name)
             .map(|i| i as u32)
     }
 
-    pub async fn elaboration_frontier(&self, uri: &str) -> u64 {
-        let inner = self.inner.lock().await;
-        let Some(progress) = inner.progress.get(uri) else {
+    pub fn set_config(&self, config: Config) {
+        self.inner.config.store(Arc::new(config));
+    }
+
+    pub fn config(&self) -> Arc<Config> {
+        self.inner.config.load_full()
+    }
+
+    pub fn elaboration_frontier(&self, uri: &str) -> u64 {
+        let Some(progress) = self.inner.progress.get(uri) else {
             return u64::MAX;
         };
         let Some(arr) = progress.get("processing").and_then(Value::as_array) else {

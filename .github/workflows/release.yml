@@ -76,12 +76,12 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/proxy${{ matrix.ext }}" \
-             "dist/lean-to-proxy-${{ matrix.target }}${{ matrix.ext }}"
+             "dist/leander-proxy-${{ matrix.target }}${{ matrix.ext }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lean-to-proxy-${{ matrix.target }}
-          path: dist/lean-to-proxy-${{ matrix.target }}${{ matrix.ext }}
+          name: leander-proxy-${{ matrix.target }}
+          path: dist/leander-proxy-${{ matrix.target }}${{ matrix.ext }}
           if-no-files-found: error
           retention-days: 1
 
@@ -104,6 +104,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: dist/lean-to-proxy-*
+          files: dist/leander-proxy-*
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -1,18 +1,19 @@
 #![allow(clippy::cast_possible_truncation)]
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::{Arc, Mutex};
 
+use dashmap::DashMap;
 use ropey::{Rope, RopeSlice};
 use serde_json::Value;
-use tokio::sync::RwLock;
 
 #[derive(Clone, Default)]
 pub struct Documents {
-    inner: Arc<RwLock<HashMap<String, Document>>>,
+    inner: Arc<DashMap<String, Document>>,
 }
 
 struct Document {
     rope: Rope,
+    cached_text: Mutex<Option<Arc<String>>>,
 }
 
 impl Documents {
@@ -20,7 +21,7 @@ impl Documents {
         Self::default()
     }
 
-    pub async fn handle_message(&self, parsed: &Value) {
+    pub fn handle_message(&self, parsed: &Value) {
         let Some(method) = parsed.get("method").and_then(Value::as_str) else {
             return;
         };
@@ -28,41 +29,49 @@ impl Documents {
             return;
         };
         match method {
-            "textDocument/didOpen" => self.do_open(params).await,
-            "textDocument/didChange" => self.do_change(params).await,
-            "textDocument/didClose" => self.do_close(params).await,
+            "textDocument/didOpen" => self.do_open(params),
+            "textDocument/didChange" => self.do_change(params),
+            "textDocument/didClose" => self.do_close(params),
             _ => {}
         }
     }
 
-    pub async fn line_length_utf16(&self, uri: &str, line: u64) -> Option<u64> {
-        let docs = self.inner.read().await;
-        let doc = docs.get(uri)?;
+    pub fn line_length_utf16(&self, uri: &str, line: u64) -> Option<u64> {
+        let doc = self.inner.get(uri)?;
         line_len_utf16(&doc.rope, line as usize)
     }
 
-    pub async fn line_text(&self, uri: &str, line: u64) -> Option<String> {
-        let docs = self.inner.read().await;
-        let doc = docs.get(uri)?;
+    pub fn line_text(&self, uri: &str, line: u64) -> Option<String> {
+        let doc = self.inner.get(uri)?;
         let line_idx = line as usize;
         if line_idx >= doc.rope.len_lines() {
             return None;
         }
-        let slice = trim_line_break(doc.rope.line(line_idx));
-        Some(slice.to_string())
+        Some(trim_line_break(doc.rope.line(line_idx)).to_string())
     }
 
-    pub async fn full_text(&self, uri: &str) -> Option<String> {
-        let docs = self.inner.read().await;
-        docs.get(uri).map(|d| d.rope.to_string())
+    pub fn full_text(&self, uri: &str) -> Option<Arc<String>> {
+        let rope_clone = {
+            let doc = self.inner.get(uri)?;
+            if let Some(cached) = doc.cached_text.lock().unwrap().as_ref() {
+                return Some(cached.clone());
+            }
+            doc.rope.clone()
+        };
+        let materialized = Arc::new(rope_clone.to_string());
+        if let Some(doc) = self.inner.get(uri) {
+            *doc.cached_text.lock().unwrap() = Some(materialized.clone());
+        }
+        Some(materialized)
     }
 
-    pub async fn line_count(&self, uri: &str) -> Option<u64> {
-        let docs = self.inner.read().await;
-        docs.get(uri).map(|d| (d.rope.len_lines() as u64).max(1))
+    pub fn line_count(&self, uri: &str) -> Option<u64> {
+        self.inner
+            .get(uri)
+            .map(|d| (d.rope.len_lines() as u64).max(1))
     }
 
-    async fn do_open(&self, params: &Value) {
+    fn do_open(&self, params: &Value) {
         let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) else {
             return;
         };
@@ -71,31 +80,36 @@ impl Documents {
             .and_then(Value::as_str)
             .unwrap_or("");
         let rope = Rope::from_str(text);
-        self.inner
-            .write()
-            .await
-            .insert(uri.to_string(), Document { rope });
+        self.inner.insert(
+            uri.to_string(),
+            Document {
+                rope,
+                cached_text: Mutex::new(None),
+            },
+        );
     }
 
-    async fn do_change(&self, params: &Value) {
+    fn do_change(&self, params: &Value) {
         let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) else {
             return;
         };
         let Some(changes) = params.get("contentChanges").and_then(Value::as_array) else {
             return;
         };
-        let mut docs = self.inner.write().await;
-        let Some(doc) = docs.get_mut(uri) else { return };
+        let Some(mut doc) = self.inner.get_mut(uri) else {
+            return;
+        };
         for change in changes {
             apply_change(&mut doc.rope, change);
         }
+        *doc.cached_text.lock().unwrap() = None;
     }
 
-    async fn do_close(&self, params: &Value) {
+    fn do_close(&self, params: &Value) {
         let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str) else {
             return;
         };
-        self.inner.write().await.remove(uri);
+        self.inner.remove(uri);
     }
 }
 

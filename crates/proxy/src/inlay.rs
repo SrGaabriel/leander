@@ -1,7 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
+use lru::LruCache;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
 
 use crate::{
     documents::Documents,
@@ -13,6 +14,8 @@ const REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 const INLINE_TARGET_LIMIT: usize = 70;
 const ELABORATION_WAIT_BUDGET: Duration = Duration::from_secs(3);
+const MAX_CONCURRENT_PROBES: usize = 8;
+const MAX_CACHE_ENTRIES_PER_FILE: usize = 2048;
 
 pub fn spawn(
     lsp: LspHandle,
@@ -25,24 +28,38 @@ pub fn spawn(
         state: state.clone(),
         documents,
         cache: Mutex::new(HashMap::new()),
+        probe_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES)),
     });
     spawn_request_worker(inlay.clone(), requests);
     spawn_refresh_worker(inlay, state);
 }
 
-type InlayCache = HashMap<String, HashMap<(u64, u64), CachedProbe>>;
+type ProbeKey = (u64, u64);
+type ProbeLru = LruCache<ProbeKey, Option<Value>>;
+type InlayCache = HashMap<String, FileCache>;
+
+struct FileCache {
+    version: i64,
+    entries: ProbeLru,
+}
+
+impl FileCache {
+    fn new(version: i64) -> Self {
+        Self {
+            version,
+            entries: LruCache::new(
+                NonZeroUsize::new(MAX_CACHE_ENTRIES_PER_FILE).expect("non-zero cap"),
+            ),
+        }
+    }
+}
 
 struct Inlay {
     lsp: LspHandle,
     state: StateHandle,
     documents: Documents,
     cache: Mutex<InlayCache>,
-}
-
-#[derive(Clone)]
-struct CachedProbe {
-    version: i64,
-    value: Option<Value>,
+    probe_semaphore: Arc<Semaphore>,
 }
 
 fn spawn_request_worker(inlay: Arc<Inlay>, mut requests: mpsc::Receiver<InlayRequest>) {
@@ -64,7 +81,7 @@ fn spawn_refresh_worker(inlay: Arc<Inlay>, state: StateHandle) {
             tokio::select! {
                 ev = events.recv() => match ev {
                     Ok(StateEvent::ProgressChanged { uri }) => {
-                        let frontier = inlay.state.elaboration_frontier(&uri).await;
+                        let frontier = inlay.state.elaboration_frontier(&uri);
                         if frontier == u64::MAX {
                             pending = false;
                             let _ = inlay
@@ -130,7 +147,7 @@ async fn handle_request(inlay: Arc<Inlay>, req: InlayRequest) {
 }
 
 async fn wait_for_elaboration(inlay: &Inlay, uri: &str, end_line: u64) {
-    if frontier_covers(inlay.state.elaboration_frontier(uri).await, end_line) {
+    if frontier_covers(inlay.state.elaboration_frontier(uri), end_line) {
         return;
     }
 
@@ -138,7 +155,7 @@ async fn wait_for_elaboration(inlay: &Inlay, uri: &str, end_line: u64) {
     let deadline = tokio::time::Instant::now() + ELABORATION_WAIT_BUDGET;
 
     loop {
-        if frontier_covers(inlay.state.elaboration_frontier(uri).await, end_line) {
+        if frontier_covers(inlay.state.elaboration_frontier(uri), end_line) {
             return;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -165,12 +182,16 @@ async fn compute_hints_concurrently(
 ) -> Vec<Value> {
     use tokio::task::JoinSet;
 
-    let frontier = inlay.state.elaboration_frontier(uri).await;
+    let frontier = inlay.state.elaboration_frontier(uri);
     let mut set: JoinSet<Option<Vec<Value>>> = JoinSet::new();
     for line in start_line..=end_line {
         let inlay = inlay.clone();
         let uri = uri.to_string();
-        set.spawn(async move { hints_for_line(inlay, uri, line, frontier).await });
+        let semaphore = inlay.probe_semaphore.clone();
+        set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok()?;
+            hints_for_line(inlay, uri, line, frontier).await
+        });
     }
 
     let mut grouped: Vec<(u64, Vec<Value>)> = Vec::new();
@@ -194,9 +215,9 @@ async fn hints_for_line(
     line: u64,
     frontier: u64,
 ) -> Option<Vec<Value>> {
-    let line_text = inlay.documents.line_text(&uri, line).await?;
+    let line_text = inlay.documents.line_text(&uri, line)?;
     let trimmed = line_text.trim_start();
-    let line_len = inlay.documents.line_length_utf16(&uri, line).await?;
+    let line_len = inlay.documents.line_length_utf16(&uri, line)?;
 
     let mut out = Vec::new();
     let probe_eligible = line < frontier
@@ -214,7 +235,7 @@ async fn hints_for_line(
     } else {
         None
     };
-    let diagnostics = inlay.state.diagnostics_at_line(&uri, line).await;
+    let diagnostics = inlay.state.diagnostics_at_line(&uri, line);
 
     if let Some(hint) = build_hint(
         line,
@@ -225,7 +246,7 @@ async fn hints_for_line(
     ) {
         out.push(hint);
     }
-    if let Some(s) = inlay.sorry_hint(&uri, line).await {
+    if let Some(s) = inlay.sorry_hint(&uri, line) {
         out.push(s);
     }
 
@@ -237,18 +258,18 @@ impl Inlay {
         self.cache.lock().await.remove(uri);
     }
 
-    async fn sorry_hint(&self, uri: &str, line: u64) -> Option<Value> {
-        let line_text = self.documents.line_text(uri, line).await?;
+    fn sorry_hint(&self, uri: &str, line: u64) -> Option<Value> {
+        let line_text = self.documents.line_text(uri, line)?;
         let has_sorry = contains_word(&line_text, "sorry");
         let has_admit = contains_word(&line_text, "admit");
         if !has_sorry && !has_admit {
             return None;
         }
-        let line_len = self.documents.line_length_utf16(uri, line).await?;
+        let line_len = self.documents.line_length_utf16(uri, line)?;
         let label = if has_sorry {
-            " ⚠ sorry"
+            " \u{26A0} sorry"
         } else {
-            " ⚠ admit"
+            " \u{26A0} admit"
         };
         Some(json!({
             "position": { "line": line, "character": line_len },
@@ -262,21 +283,19 @@ impl Inlay {
     }
 
     async fn probe(&self, uri: &str, line: u64, character: u64) -> Option<Value> {
-        let current_version = self.state.version_for(uri).await.unwrap_or(0);
+        let current_version = self.state.version_for(uri).unwrap_or(0);
 
-        if let Some(entry) = self
-            .cache
-            .lock()
-            .await
-            .get(uri)
-            .and_then(|f| f.get(&(line, character)))
-            .cloned()
-            && entry.version == current_version
         {
-            return entry.value;
+            let mut cache = self.cache.lock().await;
+            if let Some(file) = cache.get_mut(uri)
+                && file.version == current_version
+                && let Some(entry) = file.entries.get(&(line, character))
+            {
+                return entry.clone();
+            }
         }
 
-        let was_processing = self.state.is_processing(uri, line).await;
+        let was_processing = self.state.is_processing(uri, line);
 
         let id = self.lsp.alloc_id();
         let params = json!({
@@ -291,18 +310,14 @@ impl Inlay {
         let value = result.and_then(|v| if v.is_null() { None } else { Some(v) });
 
         if !was_processing {
-            self.cache
-                .lock()
-                .await
+            let mut cache = self.cache.lock().await;
+            let entry = cache
                 .entry(uri.to_string())
-                .or_default()
-                .insert(
-                    (line, character),
-                    CachedProbe {
-                        version: current_version,
-                        value: value.clone(),
-                    },
-                );
+                .or_insert_with(|| FileCache::new(current_version));
+            if entry.version != current_version {
+                *entry = FileCache::new(current_version);
+            }
+            entry.entries.put((line, character), value.clone());
         }
         value
     }
@@ -367,12 +382,12 @@ fn error_marker_for(diagnostics: &[Value]) -> Option<String> {
                     .is_some_and(|m| m.starts_with("unsolved goals"))
             });
             if unsolved {
-                Some(" ⚠ unsolved".to_string())
+                Some(" \u{26A0} unsolved".to_string())
             } else {
-                Some(" ✗".to_string())
+                Some(" \u{2717}".to_string())
             }
         }
-        v if v == SEVERITY_WARNING => Some(" ⚠".to_string()),
+        v if v == SEVERITY_WARNING => Some(" \u{26A0}".to_string()),
         _ => None,
     }
 }
@@ -430,7 +445,7 @@ fn compute_label(prev: Option<&[&str]>, curr: Option<&[&str]>) -> Option<String>
     let curr_n = curr_targets.len();
 
     if prev_n > 0 && curr_n == 0 {
-        return Some(" ✓".to_string());
+        return Some(" \u{2713}".to_string());
     }
     if curr_n == 0 {
         return None;
@@ -443,7 +458,11 @@ fn compute_label(prev: Option<&[&str]>, curr: Option<&[&str]>) -> Option<String>
         return Some(format!(" + {}", added.join(", ")));
     }
 
-    let prefix = if prev_n > 0 { "→ ⊢" } else { "⊢" };
+    let prefix = if prev_n > 0 {
+        "\u{2192} \u{22A2}"
+    } else {
+        "\u{22A2}"
+    };
     if curr_n == 1 {
         let target = &curr_targets[0];
         let len = target.chars().count();
@@ -452,7 +471,7 @@ fn compute_label(prev: Option<&[&str]>, curr: Option<&[&str]>) -> Option<String>
         }
         let cutoff = INLINE_TARGET_LIMIT.saturating_sub(1);
         let truncated: String = target.chars().take(cutoff).collect();
-        return Some(format!(" {prefix} {truncated}…"));
+        return Some(format!(" {prefix} {truncated}\u{2026}"));
     }
     Some(format!(
         " {} {}",
@@ -484,7 +503,7 @@ fn added_hyps(prev: Option<&[&str]>, curr: Option<&[&str]>) -> Vec<String> {
 
 fn hyp_names(goal: &str) -> Vec<String> {
     goal.lines()
-        .take_while(|l| !l.starts_with('⊢'))
+        .take_while(|l| !l.starts_with('\u{22A2}'))
         .flat_map(|l| {
             let trimmed = l.trim();
             if trimmed.is_empty() || trimmed.starts_with("case ") {
@@ -502,8 +521,10 @@ fn hyp_names(goal: &str) -> Vec<String> {
 }
 
 fn extract_target(goal: &str) -> String {
-    goal.lines().find(|l| l.starts_with('⊢')).map_or_else(
-        || goal.to_string(),
-        |l| l.trim_start_matches('⊢').trim().to_string(),
-    )
+    goal.lines()
+        .find(|l| l.starts_with('\u{22A2}'))
+        .map_or_else(
+            || goal.to_string(),
+            |l| l.trim_start_matches('\u{22A2}').trim().to_string(),
+        )
 }

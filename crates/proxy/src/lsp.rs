@@ -291,99 +291,62 @@ async fn c2s_task(
         match read_message(&mut reader).await {
             Ok(Some((hdr, body))) => {
                 let parsed: Option<Value> = serde_json::from_slice(&body).ok();
-                if let Some(ref v) = parsed
-                    && let Some(id) = v.get("id").and_then(Value::as_str)
-                    && id.starts_with(ID_PREFIX)
-                    && v.get("method").is_none()
-                {
-                    let waiter = pending.lock().expect("pending mutex poisoned").remove(id);
-                    if let Some(tx) = waiter {
-                        let _ = tx.send(extract_result(v));
-                    }
-                    continue;
-                }
-                if let Some(ref v) = parsed
-                    && v.get("method").and_then(Value::as_str) == Some("initialize")
-                    && let Some(opts) = v.pointer("/params/initializationOptions")
-                {
-                    state.set_config(Config::from_init_options(opts)).await;
-                }
 
-                let cfg = state.config().await;
-
-                if cfg.inlay_hints
-                    && let Some(ref v) = parsed
-                    && v.get("method").and_then(Value::as_str) == Some("textDocument/inlayHint")
-                    && v.get("id").is_some()
-                {
-                    let id = v.get("id").cloned().unwrap_or(Value::Null);
-                    let params = v.get("params").cloned().unwrap_or(Value::Null);
-                    let _ = inlay_requests.send(InlayRequest { id, params }).await;
-                    continue;
-                }
-                if cfg.code_lens
-                    && let Some(ref v) = parsed
-                    && v.get("method").and_then(Value::as_str) == Some("textDocument/codeLens")
-                    && v.get("id").is_some()
-                {
-                    let id = v.get("id").cloned().unwrap_or(Value::Null);
-                    let params = v.get("params").cloned().unwrap_or(Value::Null);
-                    let _ = lens_requests.send(CodeLensRequest { id, params }).await;
-                    continue;
-                }
-                if cfg.semantic_tokens
-                    && let Some(ref v) = parsed
-                    && v.get("method").and_then(Value::as_str)
-                        == Some("textDocument/semanticTokens/full")
-                    && v.get("id").is_some()
-                {
-                    let id = v.get("id").cloned().unwrap_or(Value::Null);
-                    let params = v.get("params").cloned().unwrap_or(Value::Null);
-                    let _ = semantic_requests
-                        .send(SemanticTokensRequest { id, params })
-                        .await;
-                    continue;
-                }
-                if cfg.hover
-                    && let Some(ref v) = parsed
-                    && v.get("method").and_then(Value::as_str) == Some("textDocument/hover")
-                    && let Some(id) = v.get("id").cloned()
-                    && let Some(uri) = v
-                        .pointer("/params/textDocument/uri")
-                        .and_then(Value::as_str)
-                    && let Some(line) = v.pointer("/params/position/line").and_then(Value::as_u64)
-                    && let Some(character) = v
-                        .pointer("/params/position/character")
-                        .and_then(Value::as_u64)
-                {
-                    let handle = handle.clone();
-                    let state = state.clone();
-                    let uri = uri.to_string();
-                    tokio::spawn(async move {
-                        merge_hover(handle, state, id, uri, line, character).await;
-                    });
-                    continue;
-                }
                 if let Some(ref v) = parsed {
-                    if let Some(pos) = snoop::extract_cursor(v) {
-                        let _ = cursor_tx.send(Some(pos));
+                    if is_proxy_response(v) {
+                        let id = v.get("id").and_then(Value::as_str).expect("verified above");
+                        let waiter = pending.lock().expect("pending mutex poisoned").remove(id);
+                        if let Some(tx) = waiter {
+                            let _ = tx.send(extract_result(v));
+                        }
+                        continue;
                     }
-                    if snoop::is_initialized(v) {
-                        let _ = init_tx.send(true);
+
+                    let method = v.get("method").and_then(Value::as_str);
+                    let has_id = v.get("id").is_some();
+
+                    if method == Some("initialize")
+                        && let Some(opts) = v.pointer("/params/initializationOptions")
+                    {
+                        state.set_config(Config::from_init_options(opts));
                     }
-                    if let Some(uri) = snoop::extract_did_open(v) {
-                        state.note_did_open(uri);
+
+                    let cfg = state.config();
+
+                    let intercepted = match method {
+                        Some("textDocument/inlayHint") if cfg.inlay_hints && has_id => {
+                            let id = v.get("id").cloned().unwrap_or(Value::Null);
+                            let params = v.get("params").cloned().unwrap_or(Value::Null);
+                            let _ = inlay_requests.send(InlayRequest { id, params }).await;
+                            true
+                        }
+                        Some("textDocument/codeLens") if cfg.code_lens && has_id => {
+                            let id = v.get("id").cloned().unwrap_or(Value::Null);
+                            let params = v.get("params").cloned().unwrap_or(Value::Null);
+                            let _ = lens_requests.send(CodeLensRequest { id, params }).await;
+                            true
+                        }
+                        Some("textDocument/semanticTokens/full")
+                            if cfg.semantic_tokens && has_id =>
+                        {
+                            let id = v.get("id").cloned().unwrap_or(Value::Null);
+                            let params = v.get("params").cloned().unwrap_or(Value::Null);
+                            let _ = semantic_requests
+                                .send(SemanticTokensRequest { id, params })
+                                .await;
+                            true
+                        }
+                        Some("textDocument/hover") if cfg.hover => {
+                            spawn_merge_hover_if_valid(v, &handle, &state)
+                        }
+                        _ => false,
+                    };
+                    if intercepted {
+                        continue;
                     }
-                    if let Some(uri) = snoop::extract_did_close(v) {
-                        state.note_did_close(uri).await;
-                    }
-                    if let Some((uri, ver)) = snoop::extract_did_open_version(v) {
-                        state.update_version(uri, ver).await;
-                    }
-                    if let Some((uri, ver)) = snoop::extract_did_change(v) {
-                        state.update_version(uri, ver).await;
-                    }
-                    documents.handle_message(v).await;
+
+                    dispatch_state_updates(v, &cursor_tx, &init_tx, &state);
+                    documents.handle_message(v);
                 }
 
                 let mut frame = hdr;
@@ -429,7 +392,7 @@ async fn s2c_task(
                     && let Some(params) = v.get("params")
                     && let Some(uri) = params.pointer("/textDocument/uri").and_then(Value::as_str)
                 {
-                    state.update_progress(uri.to_string(), params.clone()).await;
+                    state.update_progress(uri.to_string(), params.clone());
                 }
                 if let Some(ref v) = parsed
                     && v.get("method").and_then(Value::as_str)
@@ -442,7 +405,7 @@ async fn s2c_task(
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
-                    state.update_diagnostics(uri.to_string(), diags).await;
+                    state.update_diagnostics(uri.to_string(), diags);
                 }
 
                 if let Some(ref v) = parsed
@@ -456,7 +419,7 @@ async fn s2c_task(
                             .filter_map(Value::as_str)
                             .map(str::to_string)
                             .collect();
-                        state.set_semantic_token_types(names).await;
+                        state.set_semantic_token_types(names);
                     }
                     if let Some(mods) = legend.get("tokenModifiers").and_then(Value::as_array) {
                         let names: Vec<String> = mods
@@ -464,11 +427,11 @@ async fn s2c_task(
                             .filter_map(Value::as_str)
                             .map(str::to_string)
                             .collect();
-                        state.set_semantic_token_modifiers(names).await;
+                        state.set_semantic_token_modifiers(names);
                     }
                 }
 
-                let cfg = state.config().await;
+                let cfg = state.config();
                 let (out_hdr, out_body) = if let Some(ref v) = parsed
                     && is_initialize_response(v)
                     && let Some(modified) = maybe_inject_capabilities(v.clone(), &cfg)
@@ -523,6 +486,68 @@ fn is_initialize_response(v: &Value) -> bool {
         .is_some_and(Value::is_object)
 }
 
+fn is_proxy_response(v: &Value) -> bool {
+    v.get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with(ID_PREFIX))
+        && v.get("method").is_none()
+}
+
+fn spawn_merge_hover_if_valid(v: &Value, handle: &LspHandle, state: &StateHandle) -> bool {
+    let Some(id) = v.get("id").cloned() else {
+        return false;
+    };
+    let Some(uri) = v
+        .pointer("/params/textDocument/uri")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Some(line) = v.pointer("/params/position/line").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(character) = v
+        .pointer("/params/position/character")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+
+    let handle = handle.clone();
+    let state = state.clone();
+    let uri = uri.to_string();
+    tokio::spawn(async move {
+        merge_hover(handle, state, id, uri, line, character).await;
+    });
+    true
+}
+
+fn dispatch_state_updates(
+    v: &Value,
+    cursor_tx: &watch::Sender<Option<CursorPos>>,
+    init_tx: &watch::Sender<bool>,
+    state: &StateHandle,
+) {
+    if let Some(pos) = snoop::extract_cursor(v) {
+        let _ = cursor_tx.send(Some(pos));
+    }
+    if snoop::is_initialized(v) {
+        let _ = init_tx.send(true);
+    }
+    if let Some(uri) = snoop::extract_did_open(v) {
+        state.note_did_open(uri);
+    }
+    if let Some(uri) = snoop::extract_did_close(v) {
+        state.note_did_close(uri);
+    }
+    if let Some((uri, ver)) = snoop::extract_did_open_version(v) {
+        state.update_version(uri, ver);
+    }
+    if let Some((uri, ver)) = snoop::extract_did_change(v) {
+        state.update_version(uri, ver);
+    }
+}
+
 async fn merge_hover(
     handle: LspHandle,
     state: StateHandle,
@@ -539,8 +564,8 @@ async fn merge_hover(
         "position": { "line": line, "character": character },
     });
     let hover_fut = handle.request_with_id(&hover_id, "textDocument/hover", hover_params);
-    let frontier = state.elaboration_frontier(&uri).await;
-    let in_progress = state.is_processing(&uri, line).await;
+    let frontier = state.elaboration_frontier(&uri);
+    let in_progress = state.is_processing(&uri, line);
     let goal_worth_querying = line < frontier && !in_progress;
 
     let (hover_value, goal_value) = if goal_worth_querying {
@@ -638,24 +663,6 @@ fn maybe_inject_capabilities(mut v: Value, cfg: &Config) -> Option<Value> {
         changed = true;
     }
     if cfg.code_lens && !caps.contains_key("codeLensProvider") {
-        caps.insert(
-            "codeLensProvider".to_string(),
-            json!({ "resolveProvider": false }),
-        );
-        changed = true;
-    }
-    if changed { Some(v) } else { None }
-}
-
-#[allow(dead_code)]
-fn maybe_inject_inlay_capability(mut v: Value) -> Option<Value> {
-    let caps = v.pointer_mut("/result/capabilities")?.as_object_mut()?;
-    let mut changed = false;
-    if !caps.contains_key("inlayHintProvider") {
-        caps.insert("inlayHintProvider".to_string(), json!(true));
-        changed = true;
-    }
-    if !caps.contains_key("codeLensProvider") {
         caps.insert(
             "codeLensProvider".to_string(),
             json!({ "resolveProvider": false }),

@@ -40,7 +40,7 @@ async fn maybe_restart(
     uri: &str,
     last_restart: &mut HashMap<String, Instant>,
 ) {
-    if !state.config().await.auto_restart {
+    if !state.config().auto_restart {
         return;
     }
     if let Some(t) = last_restart.get(uri)
@@ -49,7 +49,7 @@ async fn maybe_restart(
         return;
     }
 
-    let diagnostics = state.diagnostics_for(uri).await;
+    let diagnostics = state.diagnostics_for(uri);
     let needs_restart = diagnostics.iter().any(|d| {
         d.get("message")
             .and_then(Value::as_str)
@@ -59,10 +59,10 @@ async fn maybe_restart(
         return;
     }
 
-    let Some(text) = documents.full_text(uri).await else {
+    let Some(text) = documents.full_text(uri) else {
         return;
     };
-    let version = state.version_for(uri).await.unwrap_or(0);
+    let version = state.version_for(uri).unwrap_or(0);
 
     eprintln!("[restart] auto-restarting {uri} (outdated imports)");
     last_restart.insert(uri.to_string(), Instant::now());
@@ -81,7 +81,7 @@ async fn maybe_restart(
                     "uri": uri,
                     "languageId": LANGUAGE_ID,
                     "version": version,
-                    "text": text,
+                    "text": &*text,
                 }
             }),
         )

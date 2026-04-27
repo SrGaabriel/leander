@@ -1,14 +1,14 @@
-id = "lean-to"
-name = "Lean-to"
-description = "Support for Lean 4 and the infoview in Zed."
-version = "0.3.0"
+id = "leander"
+name = "Leander"
+description = "Enhanced and idiomatic Zed support for Lean 4"
+version = "0.4.0"
 schema_version = 1
 authors = ["Gabriel <gabriel@minatel.dev>"]
-repository = "https://github.com/SrGaabriel/lean-to"
+repository = "https://github.com/SrGaabriel/leander"
 snippets = "snippets/lean 4.json"
 
-[language_servers.lean-to-proxy]
-name = "Lean-to Proxy"
+[language_servers.leander-proxy]
+name = "Leander Proxy"
 languages = ["Lean 4"]
 
 [grammars.lean]

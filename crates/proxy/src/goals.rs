@@ -67,7 +67,7 @@ async fn run(
             continue;
         }
 
-        if state.is_processing(&pos.uri, pos.line).await {
+        if state.is_processing(&pos.uri, pos.line) {
             continue;
         }
 
@@ -86,9 +86,7 @@ async fn run(
         prev_handle = Some(tokio::spawn(async move {
             match rpc.call_at(&pos.uri, pos.line, pos.character, &id).await {
                 Ok(result) => {
-                    state
-                        .update_goals(&pos.uri, pos.line, pos.character, result)
-                        .await;
+                    state.update_goals(&pos.uri, pos.line, pos.character, result);
                 }
                 Err(e) if e.code == ERROR_CANCELLED => {}
                 Err(e) => {
