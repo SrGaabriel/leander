@@ -7,8 +7,7 @@ pub struct CursorPos {
     pub character: u64,
 }
 
-pub fn extract_cursor(body: &[u8]) -> Option<CursorPos> {
-    let v: Value = serde_json::from_slice(body).ok()?;
+pub fn extract_cursor(v: &Value) -> Option<CursorPos> {
     let method = v.get("method")?.as_str()?;
     if method != "textDocument/hover" && method != "textDocument/documentHighlight" {
         return None;
@@ -24,39 +23,34 @@ pub fn extract_cursor(body: &[u8]) -> Option<CursorPos> {
     })
 }
 
-pub fn is_initialized(body: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| Some(v.get("method")?.as_str()? == "initialized"))
-        .unwrap_or(false)
+pub fn is_initialized(v: &Value) -> bool {
+    v.get("method").and_then(Value::as_str) == Some("initialized")
 }
 
-pub fn extract_did_open(body: &[u8]) -> Option<String> {
-    extract_doc_uri(body, "textDocument/didOpen")
+pub fn extract_did_open(v: &Value) -> Option<String> {
+    extract_doc_uri(v, "textDocument/didOpen")
 }
 
-pub fn extract_did_close(body: &[u8]) -> Option<String> {
-    extract_doc_uri(body, "textDocument/didClose")
+pub fn extract_did_close(v: &Value) -> Option<String> {
+    extract_doc_uri(v, "textDocument/didClose")
 }
 
-fn extract_doc_uri(body: &[u8], expected_method: &str) -> Option<String> {
-    let v: Value = serde_json::from_slice(body).ok()?;
+fn extract_doc_uri(v: &Value, expected_method: &str) -> Option<String> {
     if v.get("method")?.as_str()? != expected_method {
         return None;
     }
     Some(v.pointer("/params/textDocument/uri")?.as_str()?.to_string())
 }
 
-pub fn extract_did_open_version(body: &[u8]) -> Option<(String, i64)> {
-    extract_doc_uri_and_version(body, "textDocument/didOpen")
+pub fn extract_did_open_version(v: &Value) -> Option<(String, i64)> {
+    extract_doc_uri_and_version(v, "textDocument/didOpen")
 }
 
-pub fn extract_did_change(body: &[u8]) -> Option<(String, i64)> {
-    extract_doc_uri_and_version(body, "textDocument/didChange")
+pub fn extract_did_change(v: &Value) -> Option<(String, i64)> {
+    extract_doc_uri_and_version(v, "textDocument/didChange")
 }
 
-fn extract_doc_uri_and_version(body: &[u8], expected_method: &str) -> Option<(String, i64)> {
-    let v: Value = serde_json::from_slice(body).ok()?;
+fn extract_doc_uri_and_version(v: &Value, expected_method: &str) -> Option<(String, i64)> {
     if v.get("method")?.as_str()? != expected_method {
         return None;
     }

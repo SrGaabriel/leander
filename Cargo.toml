@@ -3,7 +3,7 @@ members = ["crates/proxy", "crates/infoview", "crates/protocol"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/SrGaabriel/lean-to"
@@ -14,7 +14,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+ropey = "1.6"
 protocol = { path = "crates/protocol" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
 
 [package]
 name = "lean-to"

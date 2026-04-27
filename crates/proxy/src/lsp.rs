@@ -15,7 +15,7 @@ use tokio::{
 
 use crate::{
     documents::Documents,
-    framing::{encode_frame, read_message},
+    framing::{encode_frame, read_message, write_header},
     snoop::{self, CursorPos},
     state::{Config, StateHandle},
 };
@@ -364,25 +364,27 @@ async fn c2s_task(
                     });
                     continue;
                 }
-                if let Some(pos) = snoop::extract_cursor(&body) {
-                    let _ = cursor_tx.send(Some(pos));
+                if let Some(ref v) = parsed {
+                    if let Some(pos) = snoop::extract_cursor(v) {
+                        let _ = cursor_tx.send(Some(pos));
+                    }
+                    if snoop::is_initialized(v) {
+                        let _ = init_tx.send(true);
+                    }
+                    if let Some(uri) = snoop::extract_did_open(v) {
+                        state.note_did_open(uri);
+                    }
+                    if let Some(uri) = snoop::extract_did_close(v) {
+                        state.note_did_close(uri).await;
+                    }
+                    if let Some((uri, ver)) = snoop::extract_did_open_version(v) {
+                        state.update_version(uri, ver).await;
+                    }
+                    if let Some((uri, ver)) = snoop::extract_did_change(v) {
+                        state.update_version(uri, ver).await;
+                    }
+                    documents.handle_message(v).await;
                 }
-                if snoop::is_initialized(&body) {
-                    let _ = init_tx.send(true);
-                }
-                if let Some(uri) = snoop::extract_did_open(&body) {
-                    state.note_did_open(uri);
-                }
-                if let Some(uri) = snoop::extract_did_close(&body) {
-                    state.note_did_close(uri).await;
-                }
-                if let Some((uri, ver)) = snoop::extract_did_open_version(&body) {
-                    state.update_version(uri, ver).await;
-                }
-                if let Some((uri, ver)) = snoop::extract_did_change(&body) {
-                    state.update_version(uri, ver).await;
-                }
-                documents.handle_message(&body).await;
 
                 let mut frame = hdr;
                 frame.extend_from_slice(&body);
@@ -473,8 +475,8 @@ async fn s2c_task(
                 {
                     let new_body = serde_json::to_vec(&modified)
                         .expect("serialize modified initialize response");
-                    let new_hdr =
-                        format!("Content-Length: {}\r\n\r\n", new_body.len()).into_bytes();
+                    let mut new_hdr = Vec::with_capacity(32);
+                    write_header(&mut new_hdr, new_body.len());
                     (new_hdr, new_body)
                 } else {
                     (hdr, body)

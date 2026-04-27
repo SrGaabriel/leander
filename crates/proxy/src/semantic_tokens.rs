@@ -105,8 +105,7 @@ async fn handle_request(
                 let line_text = text
                     .split('\n')
                     .nth(line as usize)
-                    .map(|l| l.trim_end_matches('\r'))
-                    .unwrap_or("");
+                    .map_or("", |l| l.trim_end_matches('\r'));
                 let line_len = line_text.encode_utf16().count() as u32;
                 let start = if line == range.start_line {
                     range.start_col
@@ -133,27 +132,21 @@ async fn handle_request(
 
     let existing: HashSet<(u32, u32)> = tokens.iter().map(|t| (t.line, t.start)).collect();
 
+    let kinds = ScanKinds {
+        number: state.token_type_index("number").await,
+        decl_name: state
+            .token_type_index("function")
+            .await
+            .or(state.token_type_index("method").await),
+        capitalized: state.token_type_index("type").await,
+        member: state
+            .token_type_index("property")
+            .await
+            .or(state.token_type_index("method").await),
+    };
+
     let mut additions: Vec<Token> = Vec::new();
-    if let Some(idx) = state.token_type_index("number").await {
-        scan_numbers(&text, idx, &mut additions);
-    }
-    if let Some(idx) = state
-        .token_type_index("function")
-        .await
-        .or(state.token_type_index("method").await)
-    {
-        scan_decl_names(&text, idx, &mut additions);
-    }
-    if let Some(idx) = state.token_type_index("type").await {
-        scan_capitalized_idents(&text, idx, &mut additions);
-    }
-    if let Some(idx) = state
-        .token_type_index("property")
-        .await
-        .or(state.token_type_index("method").await)
-    {
-        scan_member_access(&text, idx, &mut additions);
-    }
+    scan_lines_unified(&text, &kinds, &mut additions);
 
     additions.retain(|t| !existing.contains(&(t.line, t.start)));
     tokens.extend(additions);
@@ -219,120 +212,143 @@ fn encode_tokens(tokens: &[Token]) -> Vec<Value> {
     out
 }
 
-fn scan_numbers(text: &str, ty: u32, out: &mut Vec<Token>) {
+struct ScanKinds {
+    number: Option<u32>,
+    decl_name: Option<u32>,
+    capitalized: Option<u32>,
+    member: Option<u32>,
+}
+
+impl ScanKinds {
+    fn any(&self) -> bool {
+        self.number.is_some()
+            || self.decl_name.is_some()
+            || self.capitalized.is_some()
+            || self.member.is_some()
+    }
+}
+
+fn scan_lines_unified(text: &str, kinds: &ScanKinds, out: &mut Vec<Token>) {
+    if !kinds.any() {
+        return;
+    }
     for (line_idx, raw_line) in text.split('\n').enumerate() {
         let line = raw_line.trim_end_matches('\r');
-        let bytes = line.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i].is_ascii_digit() {
-                let prev_ident =
-                    i > 0 && line[..i].chars().next_back().is_some_and(is_ident_continue);
-                if !prev_ident {
-                    let start = i;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    let next_ident =
-                        i < bytes.len() && line[i..].chars().next().is_some_and(is_ident_continue);
-                    if !next_ident {
-                        out.push(make_token(line, line_idx, start, i, ty));
-                    }
-                    continue;
-                }
-            }
-            i += line[i..].chars().next().map_or(1, char::len_utf8);
+        if let Some(ty) = kinds.decl_name {
+            scan_decl_in_line(line, line_idx, ty, out);
+        }
+        if let Some(ty) = kinds.number {
+            scan_numbers_in_line(line, line_idx, ty, out);
+        }
+        if let Some(ty) = kinds.capitalized {
+            scan_caps_in_line(line, line_idx, ty, out);
+        }
+        if let Some(ty) = kinds.member {
+            scan_member_in_line(line, line_idx, ty, out);
         }
     }
 }
 
-fn scan_decl_names(text: &str, ty: u32, out: &mut Vec<Token>) {
-    for (line_idx, raw_line) in text.split('\n').enumerate() {
-        let line = raw_line.trim_end_matches('\r');
-        let trimmed = line.trim_start();
-        let leading = line.len() - trimmed.len();
-        for kw in DECL_KEYWORDS {
-            let Some(rest) = trimmed.strip_prefix(kw) else {
-                continue;
-            };
-            if !rest.starts_with(|c: char| c.is_whitespace()) {
+fn scan_numbers_in_line(line: &str, line_idx: usize, ty: u32, out: &mut Vec<Token>) {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let prev_ident = i > 0 && line[..i].chars().next_back().is_some_and(is_ident_continue);
+            if !prev_ident {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let next_ident =
+                    i < bytes.len() && line[i..].chars().next().is_some_and(is_ident_continue);
+                if !next_ident {
+                    out.push(make_token(line, line_idx, start, i, ty));
+                }
                 continue;
             }
-            let after_kw = leading + kw.len();
-            let name_offset = line[after_kw..]
-                .find(|c: char| !c.is_whitespace())
-                .unwrap_or(0);
-            let name_start = after_kw + name_offset;
-            let name_end = line[name_start..]
-                .char_indices()
-                .find(|(_, c)| !is_ident_continue(*c))
-                .map_or(line.len(), |(i, _)| name_start + i);
-            if name_end > name_start {
-                out.push(make_token(line, line_idx, name_start, name_end, ty));
-            }
+        }
+        i += line[i..].chars().next().map_or(1, char::len_utf8);
+    }
+}
+
+fn scan_caps_in_line(line: &str, line_idx: usize, ty: u32, out: &mut Vec<Token>) {
+    let mut i = 0;
+    while i < line.len() {
+        let Some(c) = line[i..].chars().next() else {
             break;
-        }
-    }
-}
-
-fn scan_capitalized_idents(text: &str, ty: u32, out: &mut Vec<Token>) {
-    for (line_idx, raw_line) in text.split('\n').enumerate() {
-        let line = raw_line.trim_end_matches('\r');
-        let mut i = 0;
-        while i < line.len() {
-            let Some((_, c)) = line[i..].char_indices().next() else {
-                break;
-            };
-            if c.is_uppercase() {
-                let prev_ident =
-                    i > 0 && line[..i].chars().next_back().is_some_and(is_ident_continue);
-                if !prev_ident {
-                    let start = i;
-                    let mut end = i;
-                    for (off, ch) in line[i..].char_indices() {
-                        if !is_ident_continue(ch) {
-                            break;
-                        }
-                        end = i + off + ch.len_utf8();
+        };
+        if c.is_uppercase() {
+            let prev_ident = i > 0 && line[..i].chars().next_back().is_some_and(is_ident_continue);
+            if !prev_ident {
+                let start = i;
+                let mut end = i;
+                for (off, ch) in line[i..].char_indices() {
+                    if !is_ident_continue(ch) {
+                        break;
                     }
-                    out.push(make_token(line, line_idx, start, end, ty));
-                    i = end;
-                    continue;
+                    end = i + off + ch.len_utf8();
                 }
+                out.push(make_token(line, line_idx, start, end, ty));
+                i = end.max(i + c.len_utf8());
+                continue;
             }
-            i += c.len_utf8();
+        }
+        i += c.len_utf8();
+    }
+}
+
+fn scan_member_in_line(line: &str, line_idx: usize, ty: u32, out: &mut Vec<Token>) {
+    for (i, c) in line.char_indices() {
+        if c != '.' {
+            continue;
+        }
+        if line[i + 1..].starts_with('.') {
+            continue;
+        }
+        let after = i + 1;
+        let Some(first) = line[after..].chars().next() else {
+            continue;
+        };
+        if !is_ident_start(first) {
+            continue;
+        }
+        let mut end = after;
+        for (off, ch) in line[after..].char_indices() {
+            if !is_ident_continue(ch) {
+                break;
+            }
+            end = after + off + ch.len_utf8();
+        }
+        if end > after {
+            out.push(make_token(line, line_idx, after, end, ty));
         }
     }
 }
 
-fn scan_member_access(text: &str, ty: u32, out: &mut Vec<Token>) {
-    for (line_idx, raw_line) in text.split('\n').enumerate() {
-        let line = raw_line.trim_end_matches('\r');
-        for (i, c) in line.char_indices() {
-            if c != '.' {
-                continue;
-            }
-            if line[i + 1..].starts_with('.') {
-                continue;
-            }
-            let after = i + 1;
-            let Some((_, first)) = line[after..].char_indices().next() else {
-                continue;
-            };
-            if !is_ident_start(first) {
-                continue;
-            }
-            let mut end = after;
-            for (off, ch) in line[after..].char_indices() {
-                if !is_ident_continue(ch) {
-                    break;
-                }
-                end = after + off + ch.len_utf8();
-            }
-            if end > after {
-                out.push(make_token(line, line_idx, after, end, ty));
-            }
+fn scan_decl_in_line(line: &str, line_idx: usize, ty: u32, out: &mut Vec<Token>) {
+    let trimmed = line.trim_start();
+    let leading = line.len() - trimmed.len();
+    for kw in DECL_KEYWORDS {
+        let Some(rest) = trimmed.strip_prefix(kw) else {
+            continue;
+        };
+        if !rest.starts_with(|c: char| c.is_whitespace()) {
+            continue;
         }
+        let after_kw = leading + kw.len();
+        let name_offset = line[after_kw..]
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(0);
+        let name_start = after_kw + name_offset;
+        let name_end = line[name_start..]
+            .char_indices()
+            .find(|(_, c)| !is_ident_continue(*c))
+            .map_or(line.len(), |(i, _)| name_start + i);
+        if name_end > name_start {
+            out.push(make_token(line, line_idx, name_start, name_end, ty));
+        }
+        return;
     }
 }
 

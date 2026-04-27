@@ -1,7 +1,7 @@
 id = "lean-to"
 name = "Lean-to"
 description = "Support for Lean 4 and the infoview in Zed."
-version = "0.1.2"
+version = "0.2.0"
 schema_version = 1
 authors = ["Gabriel <gabriel@minatel.dev>"]
 repository = "https://github.com/SrGaabriel/lean-to"
