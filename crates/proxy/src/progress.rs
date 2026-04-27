@@ -43,6 +43,13 @@ async fn handle_progress(
     active: &mut HashMap<String, String>,
     uri: &str,
 ) {
+    if !state.config().await.progress {
+        if let Some(token) = active.remove(uri) {
+            end_progress(lsp, &token).await;
+        }
+        return;
+    }
+
     let frontier = state.elaboration_frontier(uri).await;
     let total_lines = documents.line_count(uri).await.unwrap_or(0);
 

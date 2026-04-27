@@ -5,10 +5,7 @@ def createFile (path : System.FilePath) (content : String) : IO Unit := do
 
 theorem add_zero (n : Nat) : n + 0 = n := by
   induction n with
-  | zero =>
-      have h₀ : (0 : Nat) + 0 = 0 := by
-        rfl
-      exact h₀
+  | zero => rfl
   | succ n ih =>
       have h₁ : Nat.succ n + 0 = Nat.succ (n + 0) := by
         rfl

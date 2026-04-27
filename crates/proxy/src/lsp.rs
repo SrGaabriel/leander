@@ -17,7 +17,7 @@ use crate::{
     documents::Documents,
     framing::{encode_frame, read_message},
     snoop::{self, CursorPos},
-    state::StateHandle,
+    state::{Config, StateHandle},
 };
 
 const ID_PREFIX: &str = "leanto:";
@@ -272,6 +272,7 @@ async fn zed_writer_task(mut stdout: Stdout, mut rx: mpsc::Receiver<Vec<u8>>) {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn c2s_task(
     to_server: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<Pending>>,
@@ -302,6 +303,16 @@ async fn c2s_task(
                     continue;
                 }
                 if let Some(ref v) = parsed
+                    && v.get("method").and_then(Value::as_str) == Some("initialize")
+                    && let Some(opts) = v.pointer("/params/initializationOptions")
+                {
+                    state.set_config(Config::from_init_options(opts)).await;
+                }
+
+                let cfg = state.config().await;
+
+                if cfg.inlay_hints
+                    && let Some(ref v) = parsed
                     && v.get("method").and_then(Value::as_str) == Some("textDocument/inlayHint")
                     && v.get("id").is_some()
                 {
@@ -310,7 +321,8 @@ async fn c2s_task(
                     let _ = inlay_requests.send(InlayRequest { id, params }).await;
                     continue;
                 }
-                if let Some(ref v) = parsed
+                if cfg.code_lens
+                    && let Some(ref v) = parsed
                     && v.get("method").and_then(Value::as_str) == Some("textDocument/codeLens")
                     && v.get("id").is_some()
                 {
@@ -319,7 +331,8 @@ async fn c2s_task(
                     let _ = lens_requests.send(CodeLensRequest { id, params }).await;
                     continue;
                 }
-                if let Some(ref v) = parsed
+                if cfg.semantic_tokens
+                    && let Some(ref v) = parsed
                     && v.get("method").and_then(Value::as_str)
                         == Some("textDocument/semanticTokens/full")
                     && v.get("id").is_some()
@@ -331,7 +344,8 @@ async fn c2s_task(
                         .await;
                     continue;
                 }
-                if let Some(ref v) = parsed
+                if cfg.hover
+                    && let Some(ref v) = parsed
                     && v.get("method").and_then(Value::as_str) == Some("textDocument/hover")
                     && let Some(id) = v.get("id").cloned()
                     && let Some(uri) = v
@@ -431,23 +445,32 @@ async fn s2c_task(
 
                 if let Some(ref v) = parsed
                     && is_initialize_response(v)
-                    && let Some(types) = v
-                        .pointer("/result/capabilities/semanticTokensProvider/legend/tokenTypes")
-                        .and_then(Value::as_array)
+                    && let Some(legend) =
+                        v.pointer("/result/capabilities/semanticTokensProvider/legend")
                 {
-                    let names: Vec<String> = types
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect();
-                    state.set_semantic_token_types(names).await;
+                    if let Some(types) = legend.get("tokenTypes").and_then(Value::as_array) {
+                        let names: Vec<String> = types
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                        state.set_semantic_token_types(names).await;
+                    }
+                    if let Some(mods) = legend.get("tokenModifiers").and_then(Value::as_array) {
+                        let names: Vec<String> = mods
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect();
+                        state.set_semantic_token_modifiers(names).await;
+                    }
                 }
 
+                let cfg = state.config().await;
                 let (out_hdr, out_body) = if let Some(ref v) = parsed
                     && is_initialize_response(v)
-                    && let Some(modified) = maybe_inject_inlay_capability(v.clone())
+                    && let Some(modified) = maybe_inject_capabilities(v.clone(), &cfg)
                 {
-                    eprintln!("[proxy] injected inlayHintProvider & codeLensProvider capabilities");
                     let new_body = serde_json::to_vec(&modified)
                         .expect("serialize modified initialize response");
                     let new_hdr =
@@ -605,6 +628,24 @@ fn goal_to_markdown(goal: &Value) -> String {
     String::new()
 }
 
+fn maybe_inject_capabilities(mut v: Value, cfg: &Config) -> Option<Value> {
+    let caps = v.pointer_mut("/result/capabilities")?.as_object_mut()?;
+    let mut changed = false;
+    if cfg.inlay_hints && !caps.contains_key("inlayHintProvider") {
+        caps.insert("inlayHintProvider".to_string(), json!(true));
+        changed = true;
+    }
+    if cfg.code_lens && !caps.contains_key("codeLensProvider") {
+        caps.insert(
+            "codeLensProvider".to_string(),
+            json!({ "resolveProvider": false }),
+        );
+        changed = true;
+    }
+    if changed { Some(v) } else { None }
+}
+
+#[allow(dead_code)]
 fn maybe_inject_inlay_capability(mut v: Value) -> Option<Value> {
     let caps = v.pointer_mut("/result/capabilities")?.as_object_mut()?;
     let mut changed = false;

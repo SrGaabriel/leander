@@ -40,6 +40,9 @@ async fn maybe_restart(
     uri: &str,
     last_restart: &mut HashMap<String, Instant>,
 ) {
+    if !state.config().await.auto_restart {
+        return;
+    }
     if let Some(t) = last_restart.get(uri)
         && t.elapsed().as_secs() < COOLDOWN_SECS
     {

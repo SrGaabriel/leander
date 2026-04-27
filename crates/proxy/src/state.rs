@@ -26,6 +26,49 @@ pub const SEVERITY_WARNING: i64 = 2;
 pub const SEVERITY_INFO: i64 = 3;
 pub const SEVERITY_HINT: i64 = 4;
 
+#[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Config {
+    pub inlay_hints: bool,
+    pub code_lens: bool,
+    pub semantic_tokens: bool,
+    pub hover: bool,
+    pub progress: bool,
+    pub auto_restart: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            inlay_hints: true,
+            code_lens: true,
+            semantic_tokens: true,
+            hover: true,
+            progress: true,
+            auto_restart: true,
+        }
+    }
+}
+
+impl Config {
+    pub fn from_init_options(opts: &Value) -> Self {
+        let leanto = opts.get("leanTo").or_else(|| opts.get("leanto"));
+        let mut cfg = Self::default();
+        let Some(leanto) = leanto else {
+            return cfg;
+        };
+        let read =
+            |k: &str, fallback: bool| leanto.get(k).and_then(Value::as_bool).unwrap_or(fallback);
+        cfg.inlay_hints = read("inlayHints", cfg.inlay_hints);
+        cfg.code_lens = read("codeLens", cfg.code_lens);
+        cfg.semantic_tokens = read("semanticTokens", cfg.semantic_tokens);
+        cfg.hover = read("hover", cfg.hover);
+        cfg.progress = read("progress", cfg.progress);
+        cfg.auto_restart = read("autoRestart", cfg.auto_restart);
+        cfg
+    }
+}
+
 #[derive(Clone)]
 pub struct StateHandle {
     inner: Arc<Mutex<Inner>>,
@@ -39,6 +82,8 @@ struct Inner {
     versions: HashMap<String, i64>,
     diagnostics: HashMap<String, Vec<Value>>,
     semantic_token_types: Vec<String>,
+    semantic_token_modifiers: Vec<String>,
+    config: Config,
 }
 
 impl StateHandle {
@@ -140,6 +185,28 @@ impl StateHandle {
 
     pub async fn set_semantic_token_types(&self, types: Vec<String>) {
         self.inner.lock().await.semantic_token_types = types;
+    }
+
+    pub async fn set_semantic_token_modifiers(&self, modifiers: Vec<String>) {
+        self.inner.lock().await.semantic_token_modifiers = modifiers;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn token_modifier_index(&self, name: &str) -> Option<u32> {
+        let inner = self.inner.lock().await;
+        inner
+            .semantic_token_modifiers
+            .iter()
+            .position(|m| m == name)
+            .map(|i| i as u32)
+    }
+
+    pub async fn set_config(&self, config: Config) {
+        self.inner.lock().await.config = config;
+    }
+
+    pub async fn config(&self) -> Config {
+        self.inner.lock().await.config.clone()
     }
 
     #[allow(clippy::cast_possible_truncation)]
