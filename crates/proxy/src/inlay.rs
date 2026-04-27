@@ -12,6 +12,7 @@ use crate::{
 const REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 
 const INLINE_TARGET_LIMIT: usize = 70;
+const ELABORATION_WAIT_BUDGET: Duration = Duration::from_secs(3);
 
 pub fn spawn(
     lsp: LspHandle,
@@ -119,11 +120,41 @@ async fn handle_request(inlay: Arc<Inlay>, req: InlayRequest) {
         .and_then(Value::as_u64)
         .unwrap_or(start_line);
 
+    wait_for_elaboration(&inlay, &uri, end_line).await;
+
     let hints = compute_hints_concurrently(inlay.clone(), &uri, start_line, end_line).await;
     let _ = inlay
         .lsp
         .respond_to_client(req.id, Value::Array(hints))
         .await;
+}
+
+async fn wait_for_elaboration(inlay: &Inlay, uri: &str, end_line: u64) {
+    if frontier_covers(inlay.state.elaboration_frontier(uri).await, end_line) {
+        return;
+    }
+
+    let mut events = inlay.state.subscribe();
+    let deadline = tokio::time::Instant::now() + ELABORATION_WAIT_BUDGET;
+
+    loop {
+        if frontier_covers(inlay.state.elaboration_frontier(uri).await, end_line) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Err(_) | Ok(Err(broadcast::error::RecvError::Closed)) => return,
+            Ok(Ok(StateEvent::DidClose { uri: closed })) if closed == uri => return,
+            _ => {}
+        }
+    }
+}
+
+fn frontier_covers(frontier: u64, end_line: u64) -> bool {
+    frontier == u64::MAX || frontier > end_line
 }
 
 async fn compute_hints_concurrently(
